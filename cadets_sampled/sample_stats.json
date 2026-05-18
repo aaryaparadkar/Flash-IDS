@@ -1,0 +1,29 @@
+{
+  "input_file": "/home/kronos/College/ta1-cadets-e3-official.json/ta1-cadets-e3-official.json",
+  "total_lines_scanned": 5000000,
+  "record_type_counts": {
+    "Host": 1,
+    "FileObject": 352468,
+    "Principal": 20,
+    "Subject": 26040,
+    "Event": 4600591,
+    "SrcSinkObject": 9636,
+    "UnnamedPipeObject": 4818,
+    "NetFlowObject": 6426
+  },
+  "sample_rate": 0.01,
+  "sampled_events": 45702,
+  "entity_records": 22245,
+  "train_events": 31991,
+  "test_events": 13711,
+  "split_method": "time-based (sorted by timestampNanos)",
+  "timestamp_range_ns": {
+    "min": 1522706861933350905,
+    "split": 1522794779711385638,
+    "max": 1522828443820633201
+  },
+  "output_files": {
+    "train": "/home/kronos/College/data_sampling/cadets_sampled/train.jsonl",
+    "test": "/home/kronos/College/data_sampling/cadets_sampled/test.jsonl"
+  }
+}
