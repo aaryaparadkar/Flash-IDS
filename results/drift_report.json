@@ -1,0 +1,42 @@
+[
+  {
+    "window": "W0",
+    "n_test": 7498,
+    "psi_scores": {
+      "actor_type": 0.0,
+      "object_type": 0.0,
+      "action": 0.0
+    },
+    "novel_token_rate": 0.0
+  },
+  {
+    "window": "W1",
+    "n_test": 7498,
+    "psi_scores": {
+      "actor_type": 0.0,
+      "object_type": 0.15190058053454733,
+      "action": 0.6545666519873264
+    },
+    "novel_token_rate": 0.977205153617443
+  },
+  {
+    "window": "W2",
+    "n_test": 7498,
+    "psi_scores": {
+      "actor_type": 0.0,
+      "object_type": 0.11951282598343355,
+      "action": 0.8298915846662394
+    },
+    "novel_token_rate": 0.9762087490406753
+  },
+  {
+    "window": "W3",
+    "n_test": 7498,
+    "psi_scores": {
+      "actor_type": 0.0,
+      "object_type": 0.12146926827240026,
+      "action": 0.8636082678389215
+    },
+    "novel_token_rate": 0.9781322356573192
+  }
+]
