@@ -1,0 +1,27 @@
+{
+  "train_nodes": 15071,
+  "train_edges": 2,
+  "test_nodes": 7417,
+  "test_edges": 2,
+  "snapshots": 22,
+  "pipeline_elapsed_seconds": 4.94,
+  "config": {
+    "train_paths": [
+      "cadets_sampled/train.jsonl"
+    ],
+    "test_paths": [
+      "cadets_sampled/test.jsonl"
+    ],
+    "w2v_vector_size": 30,
+    "w2v_window": 5,
+    "w2v_epochs": 300,
+    "gnn_hidden": 32,
+    "gnn_dropout": 0.5,
+    "gnn_lr": 0.01,
+    "gnn_weight_decay": 0.0005,
+    "gnn_batch_size": 5000,
+    "num_snapshots": 22,
+    "embed_mode": "hf",
+    "hf_model": "BAAI/bge-small-en-v1.5"
+  }
+}

@@ -36,12 +36,19 @@ def import_pipeline():
     return P
 
 
-def run_benchmark():
-    """Run the embedding-provider comparison benchmark (Q1) with real models."""
+def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
+                  hf_batch_size=64, hf_max_length=128):
+    """Run the embedding-provider comparison benchmark with real models.
+
+    Parameters
+    ----------
+    embed_mode : str
+        'baseline' for Word2Vec-based providers, 'hf' for Hugging Face transformer.
+    """
     import torch
     from torch_geometric.data import Data
     from torch_geometric.loader import NeighborLoader
-    from flash_embed import get_provider, TokenMeanProvider
+    from flash_embed import get_provider, TokenMeanProvider, batch_event_to_text
     from flash_benchmark import BenchmarkSuite, BenchRunConfig, BenchResult
 
     P = import_pipeline()
@@ -50,19 +57,35 @@ def run_benchmark():
         logger.error(f"Train TSV not found: {P.TRAIN_TSV}")
         return
 
-    suite = BenchmarkSuite(name="FLASH Embedding Comparison")
-    variants = [
-        ("word2vec", {"name": "word2vec", "vector_size": 30}),
-        ("random", {"name": "random", "vector_size": 30}),
-        ("token_mean", {"name": "token_mean", "vector_size": 30}),
-    ]
+    mode_tag = "hf" if embed_mode == "hf" else "baseline"
+    suite = BenchmarkSuite(name=f"FLASH Benchmark ({mode_tag})")
+
+    if embed_mode == "hf":
+        # HF mode: single provider, all configs use it
+        from flash_embed import HFTransformerProvider as _HF
+        _hf_provider = _HF(model_name=hf_model, batch_size=hf_batch_size,
+                           max_length=hf_max_length, cache_dir='.hf_cache')
+        _emb_dim = _hf_provider.vector_size
+        variants = [("hf_transformer", {"vector_size": _emb_dim})]
+        logger.info(f"HF benchmark using {hf_model} (dim={_emb_dim})")
+    else:
+        _emb_dim = P.W2V_VECTOR_SIZE
+        variants = [
+            ("word2vec", {"name": "word2vec", "vector_size": 30}),
+            ("random", {"name": "random", "vector_size": 30}),
+            ("token_mean", {"name": "token_mean", "vector_size": 30}),
+        ]
+
     for vname, vcfg in variants:
-        for seed in [42, 43]:
+        for _seed in [42, 43]:
             suite.add_config(BenchRunConfig(
-                variant=vname, data_split="default", seed=seed,
-                train_path=P.TRAIN_TSV, test_path=P.TEST_TSV,
+                variant=vname,
+                data_split="default",
+                seed=_seed,
+                train_path=P.TRAIN_TSV,
+                test_path=P.TEST_TSV,
                 gt_path="data_files/cadets.json" if os.path.exists("data_files/cadets.json") else None,
-                num_snapshots=2, vector_size=vcfg["vector_size"],
+                num_snapshots=22, vector_size=vcfg.get("vector_size", _emb_dim),
             ))
 
     logger.info(f"Benchmark suite: {len(suite.configs)} configs")
@@ -74,17 +97,12 @@ def run_benchmark():
         P._ensure_exec_path_columns(df)
         return P.prepare_graph(df)
 
-    def _build_graph(phrases, labels, edges, vector_size):
-        nodes = np.random.randn(len(phrases), vector_size).astype(np.float32)
-        graph = Data(x=torch.tensor(nodes, dtype=torch.float).to(P.device),
-                     y=torch.tensor(labels, dtype=torch.long).to(P.device),
-                     edge_index=torch.tensor(edges, dtype=torch.long).to(P.device))
-        graph.n_id = torch.arange(graph.num_nodes)
-        return graph
-
     def _embed_phrases(phrases, vector_size, variant, seed):
         np.random.seed(seed)
         torch.manual_seed(seed)
+        if embed_mode == "hf":
+            texts = batch_event_to_text(phrases)
+            return _hf_provider.embed_batch(texts)
         cfg = {"name": variant, "vector_size": vector_size}
         if variant == "word2vec":
             cfg["model_path"] = P.W2V_MODEL_PATH
@@ -93,10 +111,10 @@ def run_benchmark():
             provider.fit(phrases)
         return np.array([provider.embed(p) for p in phrases], dtype=np.float32)
 
-    def _train_gnn(graph, num_snapshots, model_prefix, seed):
+    def _train_gnn(graph, num_snapshots, model_prefix, variant, seed):
         torch.manual_seed(seed)
         np.random.seed(seed)
-        model = P.GCN(P.W2V_VECTOR_SIZE, len(P.LABEL_MAP)).to(P.device)
+        model = P.GCN(_emb_dim, len(P.LABEL_MAP)).to(P.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=P.GNN_LR, weight_decay=P.GNN_WEIGHT_DECAY)
         from sklearn.utils import class_weight
         from torch.nn import CrossEntropyLoss
@@ -125,14 +143,14 @@ def run_benchmark():
                 pred = indices[:, 0]
                 cond = (pred == subg.y) | (conf >= 0.9)
                 mask[subg.n_id[cond.cpu()].to(mask.device)] = False
-            sp = f'{model_prefix}_{variant}_snap{m_n}.pth'
+            sp = f'{model_prefix}_snap{m_n}.pth'
             torch.save(model.state_dict(), sp)
         return model
 
     def _ensemble_infer(model, graph, num_snapshots, model_prefix):
         mask = torch.tensor([True] * graph.num_nodes, dtype=torch.bool, device=P.device)
         for m_n in range(num_snapshots):
-            sp = f'{model_prefix}_{variant}_snap{m_n}.pth'
+            sp = f'{model_prefix}_snap{m_n}.pth'
             if not os.path.exists(sp):
                 continue
             model.load_state_dict(torch.load(sp, map_location=P.device))
@@ -160,12 +178,15 @@ def run_benchmark():
         P.logger.info(f"Benchmark run: {variant} seed={seed}")
 
         result = BenchResult(
-            variant=variant, seed=seed, data_split=cfg.data_split,
+            variant=f"{mode_tag}_{variant}", seed=seed, data_split=cfg.data_split,
             n_train_nodes=len(train_phrases), n_test_nodes=len(test_phrases),
             n_snapshots=cfg.num_snapshots,
         )
+        result.extra["embed_mode"] = embed_mode
+        if embed_mode == "hf":
+            result.extra["hf_model"] = hf_model
 
-        model_prefix = f'trained_weights/cadets/bench_{variant}_s{seed}'
+        model_prefix = f'trained_weights/cadets/bench_{mode_tag}_{variant}_s{seed}'
 
         # ── Train ──
         t0 = time.time()
@@ -175,7 +196,7 @@ def run_benchmark():
                                y=torch.tensor(train_labels, dtype=torch.long).to(P.device),
                                edge_index=torch.tensor(train_edges, dtype=torch.long).to(P.device))
             train_graph.n_id = torch.arange(train_graph.num_nodes)
-            model = _train_gnn(train_graph, cfg.num_snapshots, model_prefix, seed)
+            model = _train_gnn(train_graph, cfg.num_snapshots, model_prefix, variant, seed)
             result.train_time_s = time.time() - t0
 
             # ── Inference ──
@@ -197,6 +218,10 @@ def run_benchmark():
             if cfg.gt_path and os.path.exists(cfg.gt_path):
                 with open(cfg.gt_path) as f:
                     gt = set(json.load(f))
+                # Sanity check: warn if GT looks synthetic (proc_N pattern)
+                _sample = next(iter(gt), "")
+                if _sample and _sample.startswith("proc_"):
+                    logger.warning("  Ground truth IDs look synthetic (not CDM UUIDs) — metrics will be 0")
 
             from flash_benchmark import two_hop_propagation
             if gt:
@@ -220,8 +245,9 @@ def run_benchmark():
 
     lb = suite.leaderboard()
     logger.info(f"\nBenchmark leaderboard:\n{lb}")
-    suite.save("results/benchmark_results.json")
-    logger.info("Benchmark complete. Results saved to results/benchmark_results.json")
+    out_path = f"results/benchmark_{mode_tag}.json"
+    suite.save(out_path)
+    logger.info(f"Benchmark complete. Results saved to {out_path}")
 
 
 def run_drift_analysis():
@@ -321,9 +347,24 @@ def run_embedding_parity():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FLASH Experiments Runner")
     parser.add_argument("--mode", default="all",
-                        choices=["all", "benchmark", "drift", "embed_parity"],
+                        choices=["all", "benchmark", "drift", "embed_parity", "explain"],
                         help="Which experiment to run")
+    parser.add_argument("--embed-mode", default="baseline",
+                        choices=["baseline", "hf", "both"],
+                        help="Embedding backend: baseline (Word2Vec), hf (Hugging Face), or both")
+    parser.add_argument("--hf-model", default="BAAI/bge-small-en-v1.5",
+                        help="Hugging Face model ID for --embed-mode hf")
+    parser.add_argument("--hf-batch-size", type=int, default=64,
+                        help="Batch size for HF API calls")
+    parser.add_argument("--hf-max-length", type=int, default=128,
+                        help="Max token length for HF model")
     args = parser.parse_args()
+
+    if args.embed_mode in ("hf", "both") and not os.environ.get("HF_TOKEN"):
+        print("[bold red]Error: HF_TOKEN environment variable not set.[/bold red]")
+        print("Get a token at https://huggingface.co/settings/tokens")
+        print("Set it with: export HF_TOKEN=hf_...")
+        sys.exit(1)
 
     os.makedirs("results", exist_ok=True)
 
@@ -334,6 +375,37 @@ if __name__ == "__main__":
         run_drift_analysis()
 
     if args.mode in ("all", "benchmark"):
-        run_benchmark()
+        if args.embed_mode == "both":
+            logger.info("\n" + "=" * 60)
+            logger.info("RUN 1/2: Baseline (Word2Vec) benchmark")
+            logger.info("=" * 60)
+            run_benchmark(embed_mode="baseline",
+                          hf_model=args.hf_model,
+                          hf_batch_size=args.hf_batch_size,
+                          hf_max_length=args.hf_max_length)
+            logger.info("\n" + "=" * 60)
+            logger.info("RUN 2/2: HF Transformer benchmark")
+            logger.info("=" * 60)
+            run_benchmark(embed_mode="hf",
+                          hf_model=args.hf_model,
+                          hf_batch_size=args.hf_batch_size,
+                          hf_max_length=args.hf_max_length)
+        else:
+            run_benchmark(embed_mode=args.embed_mode,
+                          hf_model=args.hf_model,
+                          hf_batch_size=args.hf_batch_size,
+                          hf_max_length=args.hf_max_length)
+
+    if args.mode in ("all", "explain"):
+        from flash_explain import generate_explanations
+        logger.info("\n" + "=" * 60)
+        logger.info("Generating per-node explanations")
+        logger.info("=" * 60)
+        generate_explanations(
+            embed_mode="hf" if args.embed_mode != "baseline" else "baseline",
+            hf_model=args.hf_model,
+            hf_batch_size=args.hf_batch_size,
+            hf_max_length=args.hf_max_length,
+        )
 
     logger.info("\nAll experiments complete.")

@@ -671,6 +671,10 @@ def run_training_pipeline(
     test_tsv='cadets_test.txt',
     w2v_path='trained_weights/cadets/word2vec_cadets_E3.model',
     num_snapshots=22,
+    embed_mode='baseline',
+    hf_model='BAAI/bge-small-en-v1.5',
+    hf_batch_size=64,
+    hf_max_length=128,
 ):
     """
     End-to-end CDM JSONL training pipeline.
@@ -786,17 +790,36 @@ def run_training_pipeline(
     phrases, labels, edges, mapp = prepare_graph(df)
     logger.info(f"Graph: {len(phrases)} nodes, {len(edges)} edges, {len(set(labels))} classes")
 
-    # ── Step 6: Word2Vec training (if Train=True) ──
-    if Train and not USE_SYNTHETIC:
-        logger.info("")
-        logger.info("─" * 40)
-        logger.info("Step 6: Training Word2Vec")
-        logger.info("─" * 40)
-        word2vec = Word2Vec(sentences=phrases, vector_size=W2V_VECTOR_SIZE,
-                           window=W2V_WINDOW, min_count=1, workers=8,
-                           epochs=W2V_EPOCHS, callbacks=[saver, epoch_logger])
-        word2vec.save(w2v_path)
-        logger.info(f"Word2Vec model saved to {w2v_path}")
+    # ── Step 6: Embedding preparation + Word2Vec training ──
+    logger.info("")
+    logger.info("─" * 40)
+    logger.info(f"Step 6: Preparing embeddings (mode={embed_mode})")
+    logger.info("─" * 40)
+
+    from flash_embed import get_provider as _get_provider, batch_event_to_text
+
+    if embed_mode == 'hf':
+        _hf_provider = _get_provider('hf', model_name=hf_model,
+                                      batch_size=hf_batch_size,
+                                      max_length=hf_max_length,
+                                      cache_dir='.hf_cache')
+        _emb_dim = _hf_provider.vector_size
+        logger.info(f"Using HF provider: {hf_model} (dim={_emb_dim})")
+        logger.info(f"  Embedding {len(phrases)} training phrases...")
+        _train_texts = batch_event_to_text(phrases)
+        nodes = _hf_provider.embed_batch(_train_texts)
+        logger.info(f"  Done — shape={nodes.shape}")
+    else:
+        _emb_dim = W2V_VECTOR_SIZE
+        if Train and not USE_SYNTHETIC:
+            logger.info("Step 6a: Training Word2Vec")
+            word2vec = Word2Vec(sentences=phrases, vector_size=W2V_VECTOR_SIZE,
+                               window=W2V_WINDOW, min_count=1, workers=8,
+                               epochs=W2V_EPOCHS, callbacks=[saver, epoch_logger])
+            word2vec.save(w2v_path)
+            logger.info(f"Word2Vec model saved to {w2v_path}")
+        nodes = [infer(x) for x in phrases]
+        nodes = np.array(nodes)
 
     # ── Step 7: GNN training ──
     if Train:
@@ -808,16 +831,13 @@ def run_training_pipeline(
         from sklearn.utils import class_weight
         from torch.nn import CrossEntropyLoss
 
-        model = GCN(W2V_VECTOR_SIZE, len(LABEL_MAP)).to(device)
+        model = GCN(_emb_dim, len(LABEL_MAP)).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=GNN_LR, weight_decay=GNN_WEIGHT_DECAY)
 
         l = np.array(labels)
         class_weights = class_weight.compute_class_weight(class_weight=None, classes=np.unique(l), y=l)
         class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
         criterion = CrossEntropyLoss(weight=class_weights, reduction='mean')
-
-        nodes = [infer(x) for x in phrases]
-        nodes = np.array(nodes)
 
         graph = Data(x=torch.tensor(nodes, dtype=torch.float).to(device),
                      y=torch.tensor(labels, dtype=torch.long).to(device),
@@ -872,8 +892,13 @@ def run_training_pipeline(
     eval_phrases, eval_labels, eval_edges, eval_mapp = prepare_graph(test_df)
     logger.info(f"Test graph: {len(eval_phrases)} nodes, {len(eval_edges)} edges")
 
-    eval_nodes = [infer(x) for x in eval_phrases]
-    eval_nodes = np.array(eval_nodes)
+    if embed_mode == 'hf':
+        logger.info(f"  Embedding {len(eval_phrases)} test phrases via HF...")
+        _eval_texts = batch_event_to_text(eval_phrases)
+        eval_nodes = _hf_provider.embed_batch(_eval_texts)
+    else:
+        eval_nodes = [infer(x) for x in eval_phrases]
+        eval_nodes = np.array(eval_nodes)
 
     eval_graph = Data(x=torch.tensor(eval_nodes, dtype=torch.float).to(device),
                       y=torch.tensor(eval_labels, dtype=torch.long).to(device),
@@ -995,8 +1020,33 @@ def _safe_prepare_graph(df):
 prepare_graph = _safe_prepare_graph
 
 if __name__ == '__main__':
+    import argparse as _argparse
+    _parser = _argparse.ArgumentParser(description="Flash-IDS Training Pipeline")
+    _parser.add_argument("--embed-mode", default="baseline",
+                         choices=["baseline", "hf"],
+                         help="Embedding backend: baseline (Word2Vec) or hf (Hugging Face)")
+    _parser.add_argument("--hf-model", default="BAAI/bge-small-en-v1.5",
+                         help="Hugging Face model ID for --embed-mode hf")
+    _parser.add_argument("--hf-batch-size", type=int, default=64,
+                         help="Batch size for HF API calls")
+    _parser.add_argument("--hf-max-length", type=int, default=128,
+                         help="Max token length for HF model")
+    _args = _parser.parse_args()
+
+    if _args.embed_mode == "hf":
+        if not os.environ.get("HF_TOKEN"):
+            console.print("[bold red]Error: HF_TOKEN environment variable not set.[/bold red]")
+            console.print("Get a token at https://huggingface.co/settings/tokens")
+            console.print("Set it with: export HF_TOKEN=hf_...")
+            sys.exit(1)
+
     _start = _t.time()
-    result = run_training_pipeline()
+    result = run_training_pipeline(
+        embed_mode=_args.embed_mode,
+        hf_model=_args.hf_model,
+        hf_batch_size=_args.hf_batch_size,
+        hf_max_length=_args.hf_max_length,
+    )
     _elapsed = _t.time() - _start
     
     if result:
@@ -1013,6 +1063,8 @@ if __name__ == '__main__':
             'gnn_weight_decay': GNN_WEIGHT_DECAY,
             'gnn_batch_size': GNN_BATCH_SIZE,
             'num_snapshots': NUM_SNAPSHOTS,
+            'embed_mode': _args.embed_mode,
+            'hf_model': _args.hf_model if _args.embed_mode == 'hf' else None,
         }
         
         import json as _json
