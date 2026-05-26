@@ -56,8 +56,15 @@ Train = True                         # True=train, False=only inference
 USE_SYNTHETIC = False                # True=random data, False=real CDM JSONL
 
 # ── Input JSONL paths (CDM format, one datum per line) ──
-TRAIN_JSONL_PATHS = ['cadets_sampled/train.jsonl']   # List of training JSONL file paths
-TEST_JSONL_PATHS = ['cadets_sampled/test.jsonl']    # List of test JSONL file paths (optional)
+PREFERRED_SAMPLED_DIR = os.environ.get(
+    'CADETS_SAMPLED_DIR',
+    os.path.expanduser('~/College/data_sampling/cadets_sampled')
+)
+if not os.path.exists(os.path.join(PREFERRED_SAMPLED_DIR, 'train.jsonl')):
+    PREFERRED_SAMPLED_DIR = 'cadets_sampled'
+
+TRAIN_JSONL_PATHS = [os.path.join(PREFERRED_SAMPLED_DIR, 'train.jsonl')]   # List of training JSONL file paths
+TEST_JSONL_PATHS = [os.path.join(PREFERRED_SAMPLED_DIR, 'test.jsonl')]    # List of test JSONL file paths (optional)
 
 # ── Sampling (set to None for full file) ──
 SAMPLE_LINES = None                  # Number of lines to sample from each file
@@ -466,7 +473,7 @@ class GCN(torch.nn.Module):
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         x = self.conv2(x, edge_index)
-        return F.softmax(x, dim=1)
+        return x
 
 def visualize(h, color):
     z = TSNE(n_components=2).fit_transform(h.detach().cpu().numpy())
@@ -835,7 +842,7 @@ def run_training_pipeline(
         optimizer = torch.optim.Adam(model.parameters(), lr=GNN_LR, weight_decay=GNN_WEIGHT_DECAY)
 
         l = np.array(labels)
-        class_weights = class_weight.compute_class_weight(class_weight=None, classes=np.unique(l), y=l)
+        class_weights = class_weight.compute_class_weight(class_weight='balanced', classes=np.unique(l), y=l)
         class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
         criterion = CrossEntropyLoss(weight=class_weights, reduction='mean')
 
@@ -865,9 +872,10 @@ def run_training_pipeline(
             for subg in loader:
                 model.eval()
                 out = model(subg.x, subg.edge_index)
-                sorted, indices = out.sort(dim=1, descending=True)
-                conf = (sorted[:, 0] - sorted[:, 1]) / sorted[:, 0]
-                conf = (conf - conf.min()) / conf.max()
+                probs = torch.softmax(out, dim=1)
+                sorted, indices = probs.sort(dim=1, descending=True)
+                conf = (sorted[:, 0] - sorted[:, 1]) / (sorted[:, 0] + 1e-12)
+                conf = (conf - conf.min()) / (conf.max() - conf.min() + 1e-12)
                 pred = indices[:, 0]
                 cond = (pred == subg.y) | (conf >= 0.9)
                 mask[subg.n_id[cond.cpu()].to(mask.device)] = False
@@ -911,14 +919,13 @@ def run_training_pipeline(
         if not os.path.exists(snap_path):
             logger.warning(f"Snapshot {snap_path} not found, skipping")
             continue
-        model.load_state_dict(torch.load(snap_path))
+        model.load_state_dict(torch.load(snap_path, map_location=device))
         loader = NeighborLoader(eval_graph, num_neighbors=[-1, -1], batch_size=GNN_BATCH_SIZE)
         for subg in loader:
             model.eval()
             out = model(subg.x, subg.edge_index)
-            sorted, indices = out.sort(dim=1, descending=True)
-            conf = (sorted[:, 0] - sorted[:, 1]) / sorted[:, 0]
-            conf = (conf - conf.min()) / conf.max()
+            probs = torch.softmax(out, dim=1)
+            sorted, indices = probs.sort(dim=1, descending=True)
             pred = indices[:, 0]
             cond = (pred == subg.y)
             nid_cond = subg.n_id[cond]
@@ -939,6 +946,13 @@ def run_training_pipeline(
 
     all_ids = list(test_df['actorID']) + list(test_df['objectID'])
     all_ids = set(all_ids)
+    gt_overlap = len(GT_mal.intersection(all_ids)) if GT_mal else 0
+    recall_ceiling = gt_overlap / len(GT_mal) if GT_mal else 0.0
+    if GT_mal:
+        logger.info(
+            f"GT coverage in test graph: {gt_overlap}/{len(GT_mal)} "
+            f"(recall ceiling={recall_ceiling:.3f})"
+        )
     TPL, FPL = helper(set(ids), set(all_ids), GT_mal, eval_edges, eval_mapp)
 
     logger.info("═" * 60)
@@ -950,6 +964,9 @@ def run_training_pipeline(
         'test_nodes': len(eval_phrases),
         'test_edges': len(eval_edges),
         'snapshots': num_snapshots,
+        'gt_size': len(GT_mal),
+        'gt_overlap_test_ids': gt_overlap,
+        'recall_ceiling': recall_ceiling,
     }
 
 def traverse(ids, mapping, edges, hops, visited=None):
