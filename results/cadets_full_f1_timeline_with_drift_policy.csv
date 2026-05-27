@@ -1,0 +1,7 @@
+timeline,window,strategy,f1,psi_action,retrain_triggered,retrain_reason
+Early sample,early,Drift policy,0.020689655172413796,0.03960191570316407,False,ok
+Early sample,early,Static baseline,0.020689655172413796,0.03960191570316407,False,n/a
+Middle sample,middle,Drift policy,0.025723472668810286,0.03302165926863366,True,action_novelty=0.174>0.15
+Middle sample,middle,Static baseline,0.025723472668810286,0.03302165926863366,False,n/a
+Late sample,late,Drift policy,0.021978021978021973,0.06977120712432734,False,ok
+Late sample,late,Static baseline,0.0221606648199446,0.08766165101052778,False,n/a
