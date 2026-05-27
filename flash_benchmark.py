@@ -160,6 +160,11 @@ class BenchmarkSuite:
                         gt = set(json.load(f))
 
                 if gt:
+                    gt_overlap = len(gt.intersection(all_ids))
+                    recall_ceiling = (gt_overlap / len(gt)) if gt else 0.0
+                    result.extra["gt_size"] = len(gt)
+                    result.extra["gt_overlap_test_ids"] = gt_overlap
+                    result.extra["recall_ceiling"] = recall_ceiling
                     p, r, f1_val, fpr, tpr = two_hop_propagation(
                         detected, gt, all_ids,
                         infer_out.get("edges", [[], []]),

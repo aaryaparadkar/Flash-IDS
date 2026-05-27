@@ -19,6 +19,7 @@ import json
 import argparse
 import logging
 import time
+import shutil
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -34,6 +35,36 @@ def import_pipeline():
     sys.path.insert(0, os.path.dirname(__file__))
     import run_train as P
     return P
+
+
+def ensure_tsvs_current(P):
+    """Regenerate edge TSVs when the sampled JSONL split is newer.
+
+    Benchmarks consume cadets_train.txt/cadets_test.txt, while the improved
+    sampler writes JSONL. This guard prevents benchmarking stale low-coverage
+    TSVs after regenerating the sampled data.
+    """
+    pairs = [
+        (P.TRAIN_JSONL_PATHS[0], P.TRAIN_TSV),
+        (P.TEST_JSONL_PATHS[0], P.TEST_TSV),
+    ]
+    for jsonl_path, tsv_path in pairs:
+        if not os.path.exists(jsonl_path):
+            continue
+        needs_refresh = (
+            not os.path.exists(tsv_path)
+            or os.path.getmtime(jsonl_path) > os.path.getmtime(tsv_path)
+        )
+        if not needs_refresh:
+            continue
+
+        logger.info(f"Refreshing {tsv_path} from {jsonl_path}")
+        id_map = P.process_data(jsonl_path)
+        P.process_edges(jsonl_path, id_map)
+        generated = f"{jsonl_path}.txt"
+        if not os.path.exists(generated):
+            raise RuntimeError(f"Expected processed TSV not found: {generated}")
+        shutil.copyfile(generated, tsv_path)
 
 
 def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
@@ -52,6 +83,7 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
     from flash_benchmark import BenchmarkSuite, BenchRunConfig, BenchResult
 
     P = import_pipeline()
+    ensure_tsvs_current(P)
 
     if not os.path.exists(P.TRAIN_TSV):
         logger.error(f"Train TSV not found: {P.TRAIN_TSV}")
@@ -119,7 +151,7 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
         from sklearn.utils import class_weight
         from torch.nn import CrossEntropyLoss
         l = graph.y.cpu().numpy()
-        cw = class_weight.compute_class_weight(class_weight=None, classes=np.unique(l), y=l)
+        cw = class_weight.compute_class_weight(class_weight='balanced', classes=np.unique(l), y=l)
         criterion = CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float).to(P.device), reduction='mean')
         mask = torch.tensor([True] * graph.num_nodes, dtype=torch.bool, device=P.device)
         for m_n in range(num_snapshots):
@@ -137,9 +169,10 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
             for subg in loader:
                 model.eval()
                 out = model(subg.x, subg.edge_index)
-                sorted_, indices = out.sort(dim=1, descending=True)
-                conf = (sorted_[:, 0] - sorted_[:, 1]) / sorted_[:, 0]
-                conf = (conf - conf.min()) / conf.max()
+                probs = torch.softmax(out, dim=1)
+                sorted_, indices = probs.sort(dim=1, descending=True)
+                conf = (sorted_[:, 0] - sorted_[:, 1]) / (sorted_[:, 0] + 1e-12)
+                conf = (conf - conf.min()) / (conf.max() - conf.min() + 1e-12)
                 pred = indices[:, 0]
                 cond = (pred == subg.y) | (conf >= 0.9)
                 mask[subg.n_id[cond.cpu()].to(mask.device)] = False
@@ -158,7 +191,8 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
             for subg in loader:
                 model.eval()
                 out = model(subg.x, subg.edge_index)
-                sorted_, indices = out.sort(dim=1, descending=True)
+                probs = torch.softmax(out, dim=1)
+                sorted_, indices = probs.sort(dim=1, descending=True)
                 pred = indices[:, 0]
                 cond = (pred == subg.y)
                 mask[subg.n_id[cond.cpu()].to(mask.device)] = False
@@ -225,6 +259,11 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
 
             from flash_benchmark import two_hop_propagation
             if gt:
+                gt_overlap = len(gt.intersection(all_ids))
+                recall_ceiling = gt_overlap / len(gt) if gt else 0.0
+                result.extra["gt_size"] = len(gt)
+                result.extra["gt_overlap_test_ids"] = gt_overlap
+                result.extra["recall_ceiling"] = recall_ceiling
                 p, r, f1_val, fpr, tpr_ = two_hop_propagation(
                     detected_ids, gt, all_ids, test_edges, test_mapp)
                 result.precision = p
