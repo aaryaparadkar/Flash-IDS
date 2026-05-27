@@ -305,6 +305,8 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
       static_w0: train on W0, test W1/W2/W3
       expanding: train on all prior windows, test next window
       sliding_k2: train on the latest two prior windows
+      recent_only: train only on the immediately previous window
+      anchor_recent: train on W0 plus the immediately previous window
       triggered: retrain on prior windows only after meaningful drift
     """
     import copy
@@ -422,17 +424,27 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
 
     def _infer_detected(model, snapshots, graph, mapp):
         flag = torch.ones(graph.num_nodes, dtype=torch.bool, device=P.device)
+        all_conf = []
         with torch.no_grad():
             for state in snapshots:
                 model.load_state_dict(state)
                 model.eval()
                 out = model(graph.x, graph.edge_index)
-                _, indices = out.sort(dim=1, descending=True)
+                sorted_vals, indices = out.sort(dim=1, descending=True)
+                conf = (sorted_vals[:, 0] - sorted_vals[:, 1]) / sorted_vals[:, 0].clamp(min=1e-8)
+                conf = (conf - conf.min()) / (conf.max() - conf.min() + 1e-8)
+                all_conf.append(conf.detach().cpu().numpy())
                 pred = indices[:, 0]
                 flag[pred == graph.y] = False
 
         detected_idx = torch.where(flag)[0].tolist()
-        return set(mapp[i] for i in detected_idx if i < len(mapp))
+        detected = set(mapp[i] for i in detected_idx if i < len(mapp))
+        conf_arr = np.concatenate(all_conf) if all_conf else np.array([], dtype=np.float32)
+        return detected, {
+            "anomaly_rate": float(len(detected_idx) / graph.num_nodes) if graph.num_nodes else 0.0,
+            "mean_confidence": float(conf_arr.mean()) if len(conf_arr) else 0.0,
+            "low_confidence_rate": float((conf_arr < 0.25).mean()) if len(conf_arr) else 0.0,
+        }
 
     def _drift_summary(train_df, test_df):
         ref_profile = extract_feature_profiles(train_df)
@@ -461,6 +473,9 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
         strategies.append(("expanding", list(range(test_idx)), test_idx))
         sliding_start = max(0, test_idx - 2)
         strategies.append(("sliding_k2", list(range(sliding_start, test_idx)), test_idx))
+        strategies.append(("recent_only", [test_idx - 1], test_idx))
+        anchor_indices = sorted(set([0, test_idx - 1]))
+        strategies.append(("anchor_recent", anchor_indices, test_idx))
 
     for run_seed in seeds:
         logger.info(f"\n{'=' * 60}")
@@ -483,7 +498,7 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
 
             start = time.time()
             test_graph, test_mapp, test_edges = _build_graph(test_df)
-            detected = _infer_detected(model, snapshots, test_graph, test_mapp)
+            detected, online_stats = _infer_detected(model, snapshots, test_graph, test_mapp)
             infer_time = time.time() - start
 
             all_ids = set(test_mapp)
@@ -516,24 +531,32 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
                 "f1": float(f1),
                 "fpr": float(fpr),
                 "tpr": float(tpr),
+                "anomaly_rate": online_stats["anomaly_rate"],
+                "mean_confidence": online_stats["mean_confidence"],
+                "low_confidence_rate": online_stats["low_confidence_rate"],
                 "train_time_s": round(train_time, 4),
                 "infer_time_s": round(infer_time, 4),
-                "retrain_triggered": strategy in {"expanding", "sliding_k2"} and len(train_indices) > 1,
+                "retrain_triggered": strategy in {"expanding", "sliding_k2", "recent_only", "anchor_recent"} and train_indices != [0],
                 "retrain_reason": (
                     "always expand training history"
                     if strategy == "expanding" and len(train_indices) > 1
                     else "sliding recent window retrain"
                     if strategy == "sliding_k2" and len(train_indices) > 1
+                    else "recent-only retrain"
+                    if strategy == "recent_only" and train_indices != [0]
+                    else "baseline plus recent-window retrain"
+                    if strategy == "anchor_recent" and train_indices != [0]
                     else "n/a"
                 ),
             }
             results.append(row)
             logger.info(
-                f"  {strategy} -> W{test_idx}: "
-                f"PSI(action)={row['psi_scores'].get('action', 0):.3f}, "
-                f"novelty={row['novel_token_rate']:.3f}, "
-                f"P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, FPR={fpr:.3f}"
-            )
+            f"  {strategy} -> W{test_idx}: "
+            f"PSI(action)={row['psi_scores'].get('action', 0):.3f}, "
+            f"novelty={row['novel_token_rate']:.3f}, "
+            f"P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, FPR={fpr:.3f}, "
+            f"anom_rate={online_stats['anomaly_rate']:.3f}, conf={online_stats['mean_confidence']:.3f}"
+        )
 
         logger.info("\nRolling run: strategy=triggered policy")
         current_train_indices = [0]
@@ -550,7 +573,7 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
 
             start = time.time()
             test_graph, test_mapp, test_edges = _build_graph(test_df)
-            detected = _infer_detected(current_model, current_snapshots, test_graph, test_mapp)
+            detected, online_stats = _infer_detected(current_model, current_snapshots, test_graph, test_mapp)
             infer_time = time.time() - start
 
             all_ids = set(test_mapp)
@@ -583,6 +606,9 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
                 "f1": float(f1),
                 "fpr": float(fpr),
                 "tpr": float(tpr),
+                "anomaly_rate": online_stats["anomaly_rate"],
+                "mean_confidence": online_stats["mean_confidence"],
+                "low_confidence_rate": online_stats["low_confidence_rate"],
                 "train_time_s": round(current_train_time, 4),
                 "infer_time_s": round(infer_time, 4),
                 "retrain_triggered": bool(should_retrain),
@@ -591,11 +617,12 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
             results.append(row)
             logger.info(
                 f"  triggered -> W{test_idx}: "
-                f"train={row['train_windows']}, "
-                f"PSI(action)={row['psi_scores'].get('action', 0):.3f}, "
-                f"retrain={should_retrain}, "
-                f"P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, FPR={fpr:.3f}"
-            )
+            f"train={row['train_windows']}, "
+            f"PSI(action)={row['psi_scores'].get('action', 0):.3f}, "
+            f"retrain={should_retrain}, "
+            f"P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, FPR={fpr:.3f}, "
+            f"anom_rate={online_stats['anomaly_rate']:.3f}, conf={online_stats['mean_confidence']:.3f}"
+        )
 
             if should_retrain and test_idx < num_windows - 1:
                 current_train_indices = list(range(test_idx + 1))
@@ -619,11 +646,34 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
             "recall": row["recall"],
             "f1": row["f1"],
             "fpr": row["fpr"],
+            "anomaly_rate": row["anomaly_rate"],
+            "mean_confidence": row["mean_confidence"],
+            "low_confidence_rate": row["low_confidence_rate"],
             "retrain_triggered": row["retrain_triggered"],
             "retrain_reason": row["retrain_reason"],
         })
 
     summary_df = pd.DataFrame(summary_rows)
+    adaptive_rows = []
+    candidate_strategies = ["expanding", "sliding_k2", "recent_only", "anchor_recent"]
+    for (seed_value, test_window), group in summary_df.groupby(["seed", "test_window"]):
+        candidates = group[group["strategy"].isin(candidate_strategies)].copy()
+        if candidates.empty:
+            continue
+        chosen = (
+            candidates
+            .sort_values(["anomaly_rate", "mean_confidence"], ascending=[True, False])
+            .iloc[0]
+            .copy()
+        )
+        chosen["strategy"] = "adaptive_online"
+        chosen["retrain_triggered"] = chosen["train_windows"] != "W0"
+        chosen["retrain_reason"] = "selected lowest online anomaly rate among candidate retraining windows"
+        adaptive_rows.append(chosen.to_dict())
+
+    if adaptive_rows:
+        summary_df = pd.concat([summary_df, pd.DataFrame(adaptive_rows)], ignore_index=True)
+
     aggregate_df = (
         summary_df
         .groupby("strategy", as_index=False)
@@ -634,6 +684,9 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
             std_fpr=("fpr", "std"),
             mean_precision=("precision", "mean"),
             mean_recall=("recall", "mean"),
+            mean_anomaly_rate=("anomaly_rate", "mean"),
+            mean_confidence=("mean_confidence", "mean"),
+            mean_low_confidence_rate=("low_confidence_rate", "mean"),
             mean_psi_action=("psi_action", "mean"),
             retrains=("retrain_triggered", "sum"),
         )
@@ -647,6 +700,8 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
             mean_fpr=("fpr", "mean"),
             mean_psi_action=("psi_action", "mean"),
             retrain_rate=("retrain_triggered", "mean"),
+            mean_anomaly_rate=("anomaly_rate", "mean"),
+            mean_confidence=("mean_confidence", "mean"),
         )
         .sort_values(["test_window", "mean_f1", "mean_fpr"], ascending=[True, False, True])
         .groupby("test_window", as_index=False)
@@ -676,31 +731,33 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
             f"across chronological CADets windows using seed(s): {', '.join(map(str, seeds))}."
         ),
         "",
+        "It also tests recent-only and anchor-recent retraining to measure whether data selection improves adaptation beyond simply deciding when to retrain.",
+        "",
         "## Strategy Averages",
         "",
         _md_table(
             aggregate_df,
-            ["strategy", "mean_f1", "std_f1", "mean_fpr", "std_fpr", "mean_precision", "mean_recall", "mean_psi_action", "retrains"],
+            ["strategy", "mean_f1", "std_f1", "mean_fpr", "std_fpr", "mean_precision", "mean_recall", "mean_anomaly_rate", "mean_confidence", "mean_psi_action", "retrains"],
         ),
         "",
         "## Best Strategy Per Test Window",
         "",
         _md_table(
             best_by_window_df,
-            ["test_window", "strategy", "train_windows", "mean_psi_action", "mean_f1", "mean_fpr", "retrain_rate"],
+            ["test_window", "strategy", "train_windows", "mean_psi_action", "mean_f1", "mean_fpr", "mean_anomaly_rate", "mean_confidence", "retrain_rate"],
         ),
         "",
         "## Interpretation",
         "",
         "- Static W0 is the no-adaptation baseline.",
-        (
-            "- Sliding-window retraining has the best mean F1/FPR across the current multi-seed run."
-            if len(seeds) > 1
-            else "- Expanding and triggered retraining perform best in the current single-seed run."
-        ),
-        "- Expanding and triggered retraining remain close behind, showing that adaptive retraining consistently improves over the static baseline.",
-        "- Sliding-window retraining reduces action drift most aggressively, but this should be validated on more datasets because it can discard older behavioral context.",
+        "- Compare mean F1 and mean FPR together; the best drift strategy should improve detection without inflating false positives.",
+        "- Adaptive-online selects among candidate retraining windows using anomaly rate, so it does not need ground-truth labels at selection time.",
+        "- Expanding and triggered retraining show whether adaptive retraining improves over the static baseline.",
+        "- Recent-only retraining tests fast adaptation, but can forget older normal behavior.",
+        "- Anchor-recent retraining tests a compromise: keep W0 as the stable baseline and add the latest behavior window.",
+        "- Sliding-window retraining reduces action drift aggressively, but this should be validated on more datasets because it can discard older behavioral context.",
         "- The triggered policy matches expanding in this setup because drift thresholds fire before W2 and W3.",
+        "- Anomaly rate and confidence are included as online signals because they can be monitored without ground-truth labels.",
         "- Raw actor/object UUID novelty is recorded but not used as a retrain trigger because new UUIDs are normal in provenance logs.",
     ]
 
@@ -711,7 +768,12 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
             "seeds": seeds,
             "embedding": "word2vec",
             "ground_truth_path": gt_path if ground_truth else None,
-            "strategies": ["static_w0", "expanding", "sliding_k2", "triggered"],
+            "strategies": ["static_w0", "expanding", "sliding_k2", "recent_only", "anchor_recent", "triggered", "adaptive_online"],
+            "adaptive_online_policy": {
+                "candidate_strategies": candidate_strategies,
+                "selection_signal": "minimum anomaly_rate, tie-break by maximum mean_confidence",
+                "note": "This is a label-free model-selection policy evaluated from already trained candidate windows.",
+            },
             "trigger_policy": {
                 "action_psi_threshold": 0.2,
                 "object_type_psi_threshold": 0.2,
@@ -859,17 +921,27 @@ def run_drift_threshold_sensitivity(
 
     def _infer_detected(model, snapshots, graph, mapp):
         flag = torch.ones(graph.num_nodes, dtype=torch.bool, device=P.device)
+        all_conf = []
         with torch.no_grad():
             for state in snapshots:
                 model.load_state_dict(state)
                 model.eval()
                 out = model(graph.x, graph.edge_index)
-                _, indices = out.sort(dim=1, descending=True)
+                sorted_vals, indices = out.sort(dim=1, descending=True)
+                conf = (sorted_vals[:, 0] - sorted_vals[:, 1]) / sorted_vals[:, 0].clamp(min=1e-8)
+                conf = (conf - conf.min()) / (conf.max() - conf.min() + 1e-8)
+                all_conf.append(conf.detach().cpu().numpy())
                 pred = indices[:, 0]
                 flag[pred == graph.y] = False
 
         detected_idx = torch.where(flag)[0].tolist()
-        return set(mapp[i] for i in detected_idx if i < len(mapp))
+        detected = set(mapp[i] for i in detected_idx if i < len(mapp))
+        conf_arr = np.concatenate(all_conf) if all_conf else np.array([], dtype=np.float32)
+        return detected, {
+            "anomaly_rate": float(len(detected_idx) / graph.num_nodes) if graph.num_nodes else 0.0,
+            "mean_confidence": float(conf_arr.mean()) if len(conf_arr) else 0.0,
+            "low_confidence_rate": float((conf_arr < 0.25).mean()) if len(conf_arr) else 0.0,
+        }
 
     def _drift_summary(train_df, test_df):
         ref_profile = extract_feature_profiles(train_df)
@@ -894,7 +966,7 @@ def run_drift_threshold_sensitivity(
             should_retrain = action_psi > threshold
 
             test_graph, test_mapp, test_edges = _build_graph(test_df)
-            detected = _infer_detected(current_model, current_snapshots, test_graph, test_mapp)
+            detected, online_stats = _infer_detected(current_model, current_snapshots, test_graph, test_mapp)
 
             precision = recall = f1 = fpr = tpr = 0.0
             if ground_truth:
@@ -921,6 +993,9 @@ def run_drift_threshold_sensitivity(
                 "f1": float(f1),
                 "fpr": float(fpr),
                 "tpr": float(tpr),
+                "anomaly_rate": online_stats["anomaly_rate"],
+                "mean_confidence": online_stats["mean_confidence"],
+                "low_confidence_rate": online_stats["low_confidence_rate"],
                 "retrain_triggered": bool(should_retrain),
                 "n_detected": int(len(detected)),
             }
@@ -928,7 +1003,8 @@ def run_drift_threshold_sensitivity(
             logger.info(
                 f"  threshold={threshold:.2f} -> W{test_idx}: "
                 f"train={row['train_windows']}, PSI(action)={action_psi:.3f}, "
-                f"retrain={should_retrain}, F1={f1:.3f}, FPR={fpr:.3f}"
+                f"retrain={should_retrain}, F1={f1:.3f}, FPR={fpr:.3f}, "
+                f"anom_rate={online_stats['anomaly_rate']:.3f}, conf={online_stats['mean_confidence']:.3f}"
             )
 
             if should_retrain and test_idx < num_windows - 1:
@@ -951,6 +1027,9 @@ def run_drift_threshold_sensitivity(
             mean_fpr=("fpr", "mean"),
             mean_precision=("precision", "mean"),
             mean_recall=("recall", "mean"),
+            mean_anomaly_rate=("anomaly_rate", "mean"),
+            mean_confidence=("mean_confidence", "mean"),
+            mean_low_confidence_rate=("low_confidence_rate", "mean"),
             mean_psi_action=("psi_action", "mean"),
             retrain_windows=("retrain_triggered", "sum"),
             retrain_events=("total_retrains_for_policy", "max"),
@@ -982,7 +1061,7 @@ def run_drift_threshold_sensitivity(
         "",
         _md_table(
             summary_df,
-            ["policy", "action_psi_threshold", "mean_f1", "mean_fpr", "mean_precision", "mean_recall", "mean_psi_action", "retrain_events"],
+            ["policy", "action_psi_threshold", "mean_f1", "mean_fpr", "mean_precision", "mean_recall", "mean_anomaly_rate", "mean_confidence", "mean_psi_action", "retrain_events"],
         ),
         "",
         "## Interpretation",
@@ -990,6 +1069,7 @@ def run_drift_threshold_sensitivity(
         "- Lower thresholds retrain earlier and are more sensitive to drift.",
         "- Higher thresholds avoid retraining but can leave the model stale for later windows.",
         "- The best threshold should balance F1/FPR against retraining cost.",
+        "- Anomaly rate and confidence are label-free online monitoring signals that can be tracked before ground truth is available.",
     ]
 
     output = {
@@ -1015,6 +1095,130 @@ def run_drift_threshold_sensitivity(
     logger.info("Drift threshold sensitivity saved to results/drift_threshold_sensitivity.json")
     logger.info("Drift threshold report saved to results/drift_threshold_report.md")
     return output
+
+
+def run_drift_policy(action_psi_threshold=0.5, num_windows=4, num_snapshots=6, seed=42):
+    """Run the selected drift adaptation policy and write decision artifacts."""
+    output = run_drift_threshold_sensitivity(
+        num_windows=num_windows,
+        num_snapshots=num_snapshots,
+        seed=seed,
+        thresholds=[action_psi_threshold],
+    )
+    if not output:
+        return
+
+    details = output["details"]
+    summary = output["summary"][0] if output["summary"] else {}
+    decisions = []
+    for row in details:
+        is_last_window = row["test_window"] == f"W{num_windows - 1}"
+        retrain_triggered = bool(row["retrain_triggered"])
+        if retrain_triggered and is_last_window:
+            decision = "drift_detected_continue_retrain"
+        elif retrain_triggered:
+            decision = "retrain_before_next_window"
+        else:
+            decision = "keep_current_model"
+
+        reason = (
+            f"PSI(action)={row['psi_action']:.3f}>{action_psi_threshold:.3f}"
+            if retrain_triggered
+            else f"PSI(action)={row['psi_action']:.3f}<={action_psi_threshold:.3f}"
+        )
+        decisions.append({
+            "test_window": row["test_window"],
+            "train_windows": row["train_windows"],
+            "decision": decision,
+            "reason": reason,
+            "psi_action": row["psi_action"],
+            "psi_object_type": row["psi_object_type"],
+            "action_novelty": row["action_novelty"],
+            "novel_token_rate": row["novel_token_rate"],
+            "anomaly_rate": row["anomaly_rate"],
+            "mean_confidence": row["mean_confidence"],
+            "low_confidence_rate": row["low_confidence_rate"],
+            "precision": row["precision"],
+            "recall": row["recall"],
+            "f1": row["f1"],
+            "fpr": row["fpr"],
+            "n_detected": row["n_detected"],
+        })
+
+    decision_df = pd.DataFrame(decisions)
+
+    def _md_table(df, cols):
+        lines = []
+        lines.append("| " + " | ".join(cols) + " |")
+        lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+        for _, r in df.iterrows():
+            vals = []
+            for c in cols:
+                v = r[c]
+                if isinstance(v, float):
+                    vals.append(f"{v:.3f}")
+                else:
+                    vals.append(str(v))
+            lines.append("| " + " | ".join(vals) + " |")
+        return "\n".join(lines)
+
+    report_lines = [
+        "# Drift Adaptation Policy",
+        "",
+        f"Selected policy: retrain when `PSI(action) > {action_psi_threshold:.3f}`.",
+        "",
+        "This policy uses action-distribution drift as the retraining trigger. Raw actor/object UUID novelty and online detector confidence are reported as monitoring signals, but they are not retraining triggers in this version.",
+        "",
+        "## Why This Policy",
+        "",
+        "- The rolling-window experiment showed static W0 degrades under drift, while expanding/triggered retraining improves mean F1 and lowers FPR.",
+        "- The threshold sensitivity run showed `PSI(action) > 0.5` keeps similar performance to lower thresholds while reducing retraining events on this dataset.",
+        "- Action PSI is more stable than raw UUID novelty because provenance graphs naturally contain many new actor/object identifiers over time.",
+        "",
+        "## Decisions",
+        "",
+        _md_table(
+            decision_df,
+            ["test_window", "train_windows", "decision", "psi_action", "anomaly_rate", "mean_confidence", "f1", "fpr"],
+        ),
+        "",
+        "## Aggregate Result",
+        "",
+        _md_table(
+            pd.DataFrame([summary]),
+            ["policy", "mean_f1", "mean_fpr", "mean_anomaly_rate", "mean_confidence", "retrain_events"],
+        ),
+        "",
+        "## How To Use It",
+        "",
+        "1. Train the initial model on W0.",
+        "2. For each new window, compute PSI(action) against the current training window set.",
+        f"3. If PSI(action) exceeds {action_psi_threshold:.3f}, mark the window as drifted and retrain before the next window using all observed windows.",
+        "4. Track anomaly rate and confidence online so unusual detector behavior is visible before labels arrive.",
+    ]
+
+    policy_output = {
+        "metadata": {
+            "policy": "action_psi_retrain",
+            "action_psi_threshold": action_psi_threshold,
+            "seed": seed,
+            "num_windows": num_windows,
+            "num_snapshots": num_snapshots,
+        },
+        "decisions": decisions,
+        "summary": summary,
+    }
+
+    os.makedirs("results", exist_ok=True)
+    with open("results/drift_policy_decisions.json", "w") as f:
+        json.dump(policy_output, f, indent=2)
+    decision_df.to_csv("results/drift_policy_decisions.csv", index=False)
+    with open("results/drift_policy_report.md", "w") as f:
+        f.write("\n".join(report_lines))
+
+    logger.info("Drift policy decisions saved to results/drift_policy_decisions.json")
+    logger.info("Drift policy report saved to results/drift_policy_report.md")
+    return policy_output
 
 
 def run_embedding_parity():
@@ -1066,7 +1270,7 @@ def run_embedding_parity():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FLASH Experiments Runner")
     parser.add_argument("--mode", default="all",
-                        choices=["all", "benchmark", "drift", "rolling_drift", "drift_thresholds", "embed_parity", "explain"],
+                        choices=["all", "benchmark", "drift", "rolling_drift", "drift_thresholds", "drift_policy", "embed_parity", "explain"],
                         help="Which experiment to run")
     parser.add_argument("--embed-mode", default="baseline",
                         choices=["baseline", "hf", "both"],
@@ -1081,6 +1285,8 @@ if __name__ == "__main__":
                         help="Comma-separated seeds for --mode rolling_drift, e.g. 42 or 42,43,44")
     parser.add_argument("--drift-thresholds", default="0.1,0.2,0.3,0.5",
                         help="Comma-separated PSI(action) thresholds for --mode drift_thresholds")
+    parser.add_argument("--policy-action-psi-threshold", type=float, default=0.5,
+                        help="PSI(action) retraining threshold for --mode drift_policy")
     args = parser.parse_args()
 
     if args.embed_mode in ("hf", "both") and not os.environ.get("HF_TOKEN"):
@@ -1104,6 +1310,9 @@ if __name__ == "__main__":
     if args.mode in ("all", "drift_thresholds"):
         thresholds = [float(s.strip()) for s in args.drift_thresholds.split(",") if s.strip()]
         run_drift_threshold_sensitivity(thresholds=thresholds)
+
+    if args.mode in ("all", "drift_policy"):
+        run_drift_policy(action_psi_threshold=args.policy_action_psi_threshold)
 
     if args.mode in ("all", "benchmark"):
         if args.embed_mode == "both":
