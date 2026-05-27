@@ -3,3 +3,5 @@
 gnn-env/
 .python-version/
 __pycache__/
+*.tar.gz
+ta1-cadets-e3-official.json/

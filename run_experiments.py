@@ -298,7 +298,7 @@ def run_drift_analysis():
     logger.info("\nDrift report saved to results/drift_report.json")
 
 
-def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
+def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None, source_tsv=None):
     """Train/test across chronological windows to measure drift impact.
 
     Strategies:
@@ -328,7 +328,7 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None):
 
     P = import_pipeline()
 
-    source_tsv = P.TRAIN_TSV
+    source_tsv = source_tsv or P.TRAIN_TSV
     if not os.path.exists(source_tsv):
         logger.error(f"TSV not found: {source_tsv}")
         return
@@ -1283,6 +1283,8 @@ if __name__ == "__main__":
                         help="Max token length for HF model")
     parser.add_argument("--rolling-seeds", default="42",
                         help="Comma-separated seeds for --mode rolling_drift, e.g. 42 or 42,43,44")
+    parser.add_argument("--rolling-source-tsv", default=None,
+                        help="Optional TSV source for --mode rolling_drift; defaults to cadets_train.txt")
     parser.add_argument("--drift-thresholds", default="0.1,0.2,0.3,0.5",
                         help="Comma-separated PSI(action) thresholds for --mode drift_thresholds")
     parser.add_argument("--policy-action-psi-threshold", type=float, default=0.5,
@@ -1305,7 +1307,7 @@ if __name__ == "__main__":
 
     if args.mode in ("all", "rolling_drift"):
         rolling_seeds = [int(s.strip()) for s in args.rolling_seeds.split(",") if s.strip()]
-        run_rolling_drift_experiment(seeds=rolling_seeds)
+        run_rolling_drift_experiment(seeds=rolling_seeds, source_tsv=args.rolling_source_tsv)
 
     if args.mode in ("all", "drift_thresholds"):
         thresholds = [float(s.strip()) for s in args.drift_thresholds.split(",") if s.strip()]

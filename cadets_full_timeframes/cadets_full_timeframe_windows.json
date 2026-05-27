@@ -1,0 +1,41 @@
+{
+  "inputs": [
+    "ta1-cadets-e3-official.json.tar.gz"
+  ],
+  "total_events_scanned": 12915596,
+  "node_ids_indexed": 996116,
+  "windows": [
+    {
+      "name": "reference",
+      "start_event": 0,
+      "end_event": 15000,
+      "event_span": 15000,
+      "output": "cadets_full_timeframes/cadets_full_reference.tsv",
+      "edge_rows": 13451
+    },
+    {
+      "name": "early",
+      "start_event": 1291559,
+      "end_event": 1306559,
+      "event_span": 15000,
+      "output": "cadets_full_timeframes/cadets_full_early.tsv",
+      "edge_rows": 13524
+    },
+    {
+      "name": "middle",
+      "start_event": 6450298,
+      "end_event": 6465298,
+      "event_span": 15000,
+      "output": "cadets_full_timeframes/cadets_full_middle.tsv",
+      "edge_rows": 13483
+    },
+    {
+      "name": "late",
+      "start_event": 12900596,
+      "end_event": 12915596,
+      "event_span": 15000,
+      "output": "cadets_full_timeframes/cadets_full_late.tsv",
+      "edge_rows": 13923
+    }
+  ]
+}
