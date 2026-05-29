@@ -44,15 +44,23 @@ def ensure_tsvs_current(P):
     sampler writes JSONL. This guard prevents benchmarking stale low-coverage
     TSVs after regenerating the sampled data.
     """
+    sampled_dir = os.path.dirname(P.TRAIN_JSONL_PATHS[0])
+    val_jsonl = os.path.join(sampled_dir, "val.jsonl")
+    val_tsv = "cadets_val.txt" if os.path.exists(val_jsonl) else None
     pairs = [
         (P.TRAIN_JSONL_PATHS[0], P.TRAIN_TSV),
         (P.TEST_JSONL_PATHS[0], P.TEST_TSV),
     ]
+    if val_tsv:
+        pairs.append((val_jsonl, val_tsv))
+    force_refresh = bool(os.environ.get("CADETS_SAMPLED_DIR"))
     for jsonl_path, tsv_path in pairs:
         if not os.path.exists(jsonl_path):
             continue
         needs_refresh = (
-            not os.path.exists(tsv_path)
+            force_refresh
+            or tsv_path == val_tsv
+            or not os.path.exists(tsv_path)
             or os.path.getmtime(jsonl_path) > os.path.getmtime(tsv_path)
         )
         if not needs_refresh:
@@ -65,10 +73,13 @@ def ensure_tsvs_current(P):
         if not os.path.exists(generated):
             raise RuntimeError(f"Expected processed TSV not found: {generated}")
         shutil.copyfile(generated, tsv_path)
+    return val_tsv
 
 
 def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
-                  hf_batch_size=64, hf_max_length=128):
+                  hf_batch_size=64, hf_max_length=128,
+                  validation_ratio=0.2, fallback_quantile=0.995,
+                  min_validation_gt=20):
     """Run the embedding-provider comparison benchmark with real models.
 
     Parameters
@@ -79,11 +90,19 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
     import torch
     from torch_geometric.data import Data
     from torch_geometric.loader import NeighborLoader
-    from flash_embed import get_provider, TokenMeanProvider, batch_event_to_text
-    from flash_benchmark import BenchmarkSuite, BenchRunConfig, BenchResult
+    from flash_embed import get_provider, batch_event_to_text
+    from flash_benchmark import (
+        BenchmarkSuite,
+        BenchRunConfig,
+        BenchResult,
+        detections_at_threshold,
+        optimize_threshold,
+        score_auc,
+        two_hop_propagation,
+    )
 
     P = import_pipeline()
-    ensure_tsvs_current(P)
+    val_tsv = ensure_tsvs_current(P)
 
     if not os.path.exists(P.TRAIN_TSV):
         logger.error(f"Train TSV not found: {P.TRAIN_TSV}")
@@ -122,26 +141,49 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
 
     logger.info(f"Benchmark suite: {len(suite.configs)} configs")
 
-    def _load_tsv(tsv_path):
+    def _read_tsv(tsv_path):
         df = pd.read_csv(tsv_path, sep='\t', header=None,
                          names=['actorID','actor_type','objectID','object','action','timestamp'])
         df = df.dropna()
         P._ensure_exec_path_columns(df)
+        df.sort_values(by='timestamp', ascending=True, inplace=True)
+        return df
+
+    def _prepare_graph(df):
         return P.prepare_graph(df)
 
-    def _embed_phrases(phrases, vector_size, variant, seed):
+    def _split_train_validation(df):
+        if validation_ratio <= 0 or validation_ratio >= 0.5 or len(df) < 10:
+            return df, df.iloc[0:0].copy()
+        split_idx = int(len(df) * (1.0 - validation_ratio))
+        return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
+
+    def _build_provider(variant, vector_size, seed, train_phrases):
+        rng_state = np.random.get_state()
         np.random.seed(seed)
         torch.manual_seed(seed)
         if embed_mode == "hf":
-            texts = batch_event_to_text(phrases)
-            return _hf_provider.embed_batch(texts)
+            return _hf_provider
         cfg = {"name": variant, "vector_size": vector_size}
         if variant == "word2vec":
             cfg["model_path"] = P.W2V_MODEL_PATH
         provider = get_provider(**cfg)
         if hasattr(provider, "fit"):
-            provider.fit(phrases)
+            provider.fit(train_phrases)
+        np.random.set_state(rng_state)
+        return provider
+
+    def _embed_phrases(phrases, provider):
+        if embed_mode == "hf":
+            texts = batch_event_to_text(phrases)
+            return provider.embed_batch(texts)
         return np.array([provider.embed(p) for p in phrases], dtype=np.float32)
+
+    def _as_probabilities(out):
+        row_sums = out.detach().sum(dim=1)
+        if out.detach().min().item() >= 0 and torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3):
+            return out
+        return torch.softmax(out, dim=1)
 
     def _train_gnn(graph, num_snapshots, model_prefix, variant, seed):
         torch.manual_seed(seed)
@@ -169,7 +211,7 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
             for subg in loader:
                 model.eval()
                 out = model(subg.x, subg.edge_index)
-                probs = torch.softmax(out, dim=1)
+                probs = _as_probabilities(out)
                 sorted_, indices = probs.sort(dim=1, descending=True)
                 conf = (sorted_[:, 0] - sorted_[:, 1]) / (sorted_[:, 0] + 1e-12)
                 conf = (conf - conf.min()) / (conf.max() - conf.min() + 1e-12)
@@ -180,8 +222,9 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
             torch.save(model.state_dict(), sp)
         return model
 
-    def _ensemble_infer(model, graph, num_snapshots, model_prefix):
-        mask = torch.tensor([True] * graph.num_nodes, dtype=torch.bool, device=P.device)
+    def _ensemble_scores(model, graph, num_snapshots, model_prefix):
+        scores = torch.zeros(graph.num_nodes, dtype=torch.float, device=P.device)
+        counts = torch.zeros(graph.num_nodes, dtype=torch.float, device=P.device)
         for m_n in range(num_snapshots):
             sp = f'{model_prefix}_snap{m_n}.pth'
             if not os.path.exists(sp):
@@ -191,19 +234,32 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
             for subg in loader:
                 model.eval()
                 out = model(subg.x, subg.edge_index)
-                probs = torch.softmax(out, dim=1)
-                sorted_, indices = probs.sort(dim=1, descending=True)
-                pred = indices[:, 0]
-                cond = (pred == subg.y)
-                mask[subg.n_id[cond.cpu()].to(mask.device)] = False
-        index = torch.where(mask)[0].tolist()
-        return index
+                probs = _as_probabilities(out)
+                max_prob = probs.max(dim=1).values
+                entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=1)
+                entropy = entropy / np.log(probs.shape[1])
+                anomaly_score = 0.7 * (1.0 - max_prob) + 0.3 * entropy
+                node_ids = subg.n_id.to(P.device)
+                scores[node_ids] += anomaly_score.detach()
+                counts[node_ids] += 1.0
+        counts = torch.clamp(counts, min=1.0)
+        return (scores / counts).detach().cpu().numpy()
 
     # ── Load data once (shared across variants) ──
     P.logger.info("Loading training data...")
-    train_phrases, train_labels, train_edges, train_mapp = _load_tsv(P.TRAIN_TSV)
-    test_phrases, test_labels, test_edges, test_mapp = _load_tsv(P.TEST_TSV)
-    P.logger.info(f"Train: {len(train_phrases)} nodes, Test: {len(test_phrases)} nodes")
+    full_train_df = _read_tsv(P.TRAIN_TSV)
+    if val_tsv and os.path.exists(val_tsv):
+        train_df = full_train_df
+        val_df = _read_tsv(val_tsv)
+    else:
+        train_df, val_df = _split_train_validation(full_train_df)
+    test_df = _read_tsv(P.TEST_TSV)
+    train_phrases, train_labels, train_edges, train_mapp = _prepare_graph(train_df)
+    val_phrases, val_labels, val_edges, val_mapp = _prepare_graph(val_df) if len(val_df) else ([], [], [[], []], [])
+    test_phrases, test_labels, test_edges, test_mapp = _prepare_graph(test_df)
+    P.logger.info(
+        f"Train: {len(train_phrases)} nodes, Val: {len(val_phrases)} nodes, Test: {len(test_phrases)} nodes"
+    )
 
     for cfg in suite.configs:
         variant = cfg.variant
@@ -225,7 +281,8 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
         # ── Train ──
         t0 = time.time()
         try:
-            train_nodes = _embed_phrases(train_phrases, cfg.vector_size, variant, seed)
+            provider = _build_provider(variant, cfg.vector_size, seed, train_phrases)
+            train_nodes = _embed_phrases(train_phrases, provider)
             train_graph = Data(x=torch.tensor(train_nodes, dtype=torch.float).to(P.device),
                                y=torch.tensor(train_labels, dtype=torch.long).to(P.device),
                                edge_index=torch.tensor(train_edges, dtype=torch.long).to(P.device))
@@ -233,37 +290,63 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
             model = _train_gnn(train_graph, cfg.num_snapshots, model_prefix, variant, seed)
             result.train_time_s = time.time() - t0
 
-            # ── Inference ──
-            t0 = time.time()
-            test_nodes = _embed_phrases(test_phrases, cfg.vector_size, variant, seed)
-            test_graph = Data(x=torch.tensor(test_nodes, dtype=torch.float).to(P.device),
-                              y=torch.tensor(test_labels, dtype=torch.long).to(P.device),
-                              edge_index=torch.tensor(test_edges, dtype=torch.long).to(P.device))
-            test_graph.n_id = torch.arange(test_graph.num_nodes)
-            detected_idx = _ensemble_infer(model, test_graph, cfg.num_snapshots, model_prefix)
-            result.infer_time_s = time.time() - t0
-
-            detected_ids = set(test_mapp[i] for i in detected_idx if i < len(test_mapp))
-            all_ids = set(test_mapp)
-            result.n_test_nodes = len(all_ids)
-            result.extra["n_detected"] = len(detected_ids)
-
             gt = set()
             if cfg.gt_path and os.path.exists(cfg.gt_path):
                 with open(cfg.gt_path) as f:
                     gt = set(json.load(f))
-                # Sanity check: warn if GT looks synthetic (proc_N pattern)
                 _sample = next(iter(gt), "")
                 if _sample and _sample.startswith("proc_"):
-                    logger.warning("  Ground truth IDs look synthetic (not CDM UUIDs) — metrics will be 0")
+                    logger.warning("  Ground truth IDs look synthetic (not CDM UUIDs) — metrics are invalid")
 
-            from flash_benchmark import two_hop_propagation
+            # ── Validation calibration + inference ──
+            t0 = time.time()
+            train_scores = _ensemble_scores(model, train_graph, cfg.num_snapshots, model_prefix)
+
+            threshold = float(np.quantile(train_scores, fallback_quantile))
+            threshold_source = f"train_quantile_{fallback_quantile:.3f}"
+            val_stats = {}
+            if len(val_phrases):
+                val_nodes = _embed_phrases(val_phrases, provider)
+                val_graph = Data(x=torch.tensor(val_nodes, dtype=torch.float).to(P.device),
+                                 y=torch.tensor(val_labels, dtype=torch.long).to(P.device),
+                                 edge_index=torch.tensor(val_edges, dtype=torch.long).to(P.device))
+                val_graph.n_id = torch.arange(val_graph.num_nodes)
+                val_scores = _ensemble_scores(model, val_graph, cfg.num_snapshots, model_prefix)
+                if gt:
+                    val_gt_overlap = len(set(val_mapp).intersection(gt))
+                    tuned_threshold, val_stats = optimize_threshold(
+                        val_mapp, val_scores, gt, set(val_mapp), val_edges, val_mapp
+                    )
+                    if tuned_threshold is not None and val_gt_overlap >= min_validation_gt:
+                        threshold = tuned_threshold
+                        threshold_source = "validation_f1"
+                    elif tuned_threshold is not None:
+                        val_stats["reason"] = "validation_gt_overlap_below_minimum"
+                        val_stats["min_validation_gt"] = min_validation_gt
+
+            test_nodes = _embed_phrases(test_phrases, provider)
+            test_graph = Data(x=torch.tensor(test_nodes, dtype=torch.float).to(P.device),
+                              y=torch.tensor(test_labels, dtype=torch.long).to(P.device),
+                              edge_index=torch.tensor(test_edges, dtype=torch.long).to(P.device))
+            test_graph.n_id = torch.arange(test_graph.num_nodes)
+            test_scores = _ensemble_scores(model, test_graph, cfg.num_snapshots, model_prefix)
+            result.infer_time_s = time.time() - t0
+
+            detected_ids = detections_at_threshold(test_mapp, test_scores, threshold)
+            all_ids = set(test_mapp)
+            result.n_test_nodes = len(all_ids)
+            result.extra["n_detected"] = len(detected_ids)
+            result.extra["threshold"] = threshold
+            result.extra["threshold_source"] = threshold_source
+            result.extra["validation"] = val_stats
+
             if gt:
                 gt_overlap = len(gt.intersection(all_ids))
                 recall_ceiling = gt_overlap / len(gt) if gt else 0.0
                 result.extra["gt_size"] = len(gt)
                 result.extra["gt_overlap_test_ids"] = gt_overlap
                 result.extra["recall_ceiling"] = recall_ceiling
+                result.pr_auc, result.roc_auc = score_auc(test_mapp, test_scores, gt)
                 p, r, f1_val, fpr, tpr_ = two_hop_propagation(
                     detected_ids, gt, all_ids, test_edges, test_mapp)
                 result.precision = p
@@ -386,7 +469,7 @@ def run_embedding_parity():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FLASH Experiments Runner")
     parser.add_argument("--mode", default="all",
-                        choices=["all", "benchmark", "drift", "embed_parity", "explain"],
+                        choices=["all", "benchmark", "tabular", "drift", "embed_parity", "explain"],
                         help="Which experiment to run")
     parser.add_argument("--embed-mode", default="baseline",
                         choices=["baseline", "hf", "both"],
@@ -397,6 +480,14 @@ if __name__ == "__main__":
                         help="Batch size for HF API calls")
     parser.add_argument("--hf-max-length", type=int, default=128,
                         help="Max token length for HF model")
+    parser.add_argument("--validation-ratio", type=float, default=0.2,
+                        help="Chronological tail of train TSV used only for threshold calibration")
+    parser.add_argument("--fallback-quantile", type=float, default=0.995,
+                        help="Unsupervised train-score quantile used when validation has no GT overlap")
+    parser.add_argument("--min-validation-gt", type=int, default=20,
+                        help="Minimum validation GT overlap required before supervised threshold tuning")
+    parser.add_argument("--sampled-dir", default=None,
+                        help="Directory containing fair train/val/test JSONL for --mode tabular")
     args = parser.parse_args()
 
     if args.embed_mode in ("hf", "both") and not os.environ.get("HF_TOKEN"):
@@ -419,21 +510,47 @@ if __name__ == "__main__":
             logger.info("RUN 1/2: Baseline (Word2Vec) benchmark")
             logger.info("=" * 60)
             run_benchmark(embed_mode="baseline",
-                          hf_model=args.hf_model,
-                          hf_batch_size=args.hf_batch_size,
-                          hf_max_length=args.hf_max_length)
+                           hf_model=args.hf_model,
+                           hf_batch_size=args.hf_batch_size,
+                           hf_max_length=args.hf_max_length,
+                           validation_ratio=args.validation_ratio,
+                           fallback_quantile=args.fallback_quantile,
+                           min_validation_gt=args.min_validation_gt)
             logger.info("\n" + "=" * 60)
             logger.info("RUN 2/2: HF Transformer benchmark")
             logger.info("=" * 60)
             run_benchmark(embed_mode="hf",
-                          hf_model=args.hf_model,
-                          hf_batch_size=args.hf_batch_size,
-                          hf_max_length=args.hf_max_length)
+                           hf_model=args.hf_model,
+                           hf_batch_size=args.hf_batch_size,
+                           hf_max_length=args.hf_max_length,
+                           validation_ratio=args.validation_ratio,
+                           fallback_quantile=args.fallback_quantile,
+                           min_validation_gt=args.min_validation_gt)
         else:
             run_benchmark(embed_mode=args.embed_mode,
-                          hf_model=args.hf_model,
-                          hf_batch_size=args.hf_batch_size,
-                          hf_max_length=args.hf_max_length)
+                           hf_model=args.hf_model,
+                           hf_batch_size=args.hf_batch_size,
+                           hf_max_length=args.hf_max_length,
+                           validation_ratio=args.validation_ratio,
+                           fallback_quantile=args.fallback_quantile,
+                           min_validation_gt=args.min_validation_gt)
+
+    if args.mode in ("all", "tabular"):
+        from flash_tabular import run_tabular_benchmark
+        sampled_dir = args.sampled_dir or os.environ.get("CADETS_SAMPLED_DIR")
+        if not sampled_dir:
+            raise SystemExit("--sampled-dir or CADETS_SAMPLED_DIR is required for tabular benchmark")
+        payload = run_tabular_benchmark(
+            sampled_dir=sampled_dir,
+            gt_path="data_files/cadets.json",
+            out_path="results/benchmark_tabular.json",
+        )
+        best = max(payload["results"], key=lambda row: row["test"]["f1"])
+        logger.info(
+            "Tabular best: alpha=%s P=%.3f R=%.3f F1=%.3f PR-AUC=%.3f ROC-AUC=%.3f",
+            best["alpha"], best["test"]["precision"], best["test"]["recall"],
+            best["test"]["f1"], best["test"]["pr_auc"], best["test"]["roc_auc"],
+        )
 
     if args.mode in ("all", "explain"):
         from flash_explain import generate_explanations

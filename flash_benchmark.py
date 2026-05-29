@@ -13,7 +13,7 @@ import time
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Sequence, Tuple
 from collections import defaultdict
 import logging
 
@@ -64,25 +64,98 @@ def compute_metrics(tp, fp, fn, tn):
     return prec, rec, f1, fpr, tpr
 
 
+def score_auc(ids: Sequence[str], scores: Sequence[float], ground_truth_set):
+    """Compute PR-AUC/ROC-AUC for node-level anomaly scores when possible."""
+    try:
+        from sklearn.metrics import average_precision_score, roc_auc_score
+    except Exception:
+        return 0.0, 0.0
+
+    y_true = np.array([1 if node_id in ground_truth_set else 0 for node_id in ids], dtype=np.int32)
+    y_score = np.array(scores, dtype=np.float32)
+    if len(np.unique(y_true)) < 2:
+        return 0.0, 0.0
+    return float(average_precision_score(y_true, y_score)), float(roc_auc_score(y_true, y_score))
+
+
+def detections_at_threshold(ids: Sequence[str], scores: Sequence[float], threshold: float):
+    """Return node IDs with anomaly score at or above a fixed threshold."""
+    return {node_id for node_id, score in zip(ids, scores) if score >= threshold}
+
+
+def optimize_threshold(
+    ids: Sequence[str],
+    scores: Sequence[float],
+    ground_truth_set,
+    all_ids_set,
+    eval_edges,
+    eval_mapp,
+) -> Tuple[Optional[float], Dict]:
+    """Pick the best F1 threshold on validation data only.
+
+    Returns None when validation labels have no overlap with the validation graph;
+    callers should then use an unsupervised fallback threshold.
+    """
+    gt_overlap = set(ids).intersection(ground_truth_set)
+    if not gt_overlap:
+        return None, {"reason": "no_validation_gt_overlap", "gt_overlap": 0}
+
+    score_array = np.array(scores, dtype=np.float32)
+    candidates = np.unique(score_array)
+    if len(candidates) > 512:
+        candidates = np.quantile(score_array, np.linspace(0.0, 1.0, 512))
+        candidates = np.unique(candidates)
+
+    best = {
+        "threshold": float(candidates[0]),
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": -1.0,
+        "fpr": 0.0,
+        "tpr": 0.0,
+        "gt_overlap": len(gt_overlap),
+    }
+    for threshold in candidates:
+        detected = detections_at_threshold(ids, scores, float(threshold))
+        p, r, f1_val, fpr, tpr = two_hop_propagation(
+            detected, ground_truth_set, all_ids_set, eval_edges, eval_mapp
+        )
+        if f1_val > best["f1"]:
+            best.update({
+                "threshold": float(threshold),
+                "precision": p,
+                "recall": r,
+                "f1": f1_val,
+                "fpr": fpr,
+                "tpr": tpr,
+            })
+
+    return best["threshold"], best
+
+
 def two_hop_propagation(detected_set, ground_truth_set, all_ids_set, eval_edges, eval_mapp):
     """Replicate the FLASH helper/two-hop logic from the notebook."""
-    from itertools import compress
-    # Simplified two-hop expansion
+    ground_truth_set = ground_truth_set.intersection(all_ids_set)
     tp = detected_set.intersection(ground_truth_set)
     fp = detected_set - ground_truth_set
     fn = ground_truth_set - detected_set
     tn = all_ids_set - (ground_truth_set | detected_set)
-    # Two-hop expansion of TP
+
     two_hop_gt = set()
+    two_hop_tp = set()
     for edge in zip(eval_edges[0], eval_edges[1]):
         src_mapped = eval_mapp[edge[0]] if edge[0] < len(eval_mapp) else str(edge[0])
         dst_mapped = eval_mapp[edge[1]] if edge[1] < len(eval_mapp) else str(edge[1])
         if src_mapped in ground_truth_set or dst_mapped in ground_truth_set:
             two_hop_gt.add(src_mapped)
             two_hop_gt.add(dst_mapped)
-    tp_expanded = tp.union(fn.intersection(two_hop_gt))
+        if src_mapped in tp or dst_mapped in tp:
+            two_hop_tp.add(src_mapped)
+            two_hop_tp.add(dst_mapped)
+
+    tp_expanded = tp.union(fn.intersection(two_hop_tp))
     fp_after = fp - two_hop_gt
-    fn_after = fn - two_hop_gt
+    fn_after = fn - two_hop_tp
     return compute_metrics(len(tp_expanded), len(fp_after), len(fn_after), len(tn))
 
 
