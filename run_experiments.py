@@ -79,7 +79,7 @@ def ensure_tsvs_current(P):
 def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
                   hf_batch_size=64, hf_max_length=128,
                   validation_ratio=0.2, fallback_quantile=0.995,
-                  min_validation_gt=20):
+                  min_validation_gt=20, llm_filter=None):
     """Run the embedding-provider comparison benchmark with real models.
 
     Parameters
@@ -334,8 +334,21 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
 
             detected_ids = detections_at_threshold(test_mapp, test_scores, threshold)
             all_ids = set(test_mapp)
+            result.extra["n_detected_raw"] = len(detected_ids)
+
+            # ── LLM post-filter (GNN mode) ──
+            if llm_filter is not None and len(test_df):
+                ctx_dict = LLMFilter.build_context_from_tsv(test_df, test_mapp, full_train_df)
+                filtered_ids, llm_stats = llm_filter.filter(
+                    test_mapp, test_scores.tolist(), ctx_dict, threshold
+                )
+                detected_ids = set(filtered_ids)
+                result.extra["llm_filter_stats"] = llm_stats
+                result.extra["n_detected"] = len(detected_ids)
+            else:
+                result.extra["n_detected"] = len(detected_ids)
+
             result.n_test_nodes = len(all_ids)
-            result.extra["n_detected"] = len(detected_ids)
             result.extra["threshold"] = threshold
             result.extra["threshold_source"] = threshold_source
             result.extra["validation"] = val_stats
@@ -354,7 +367,14 @@ def run_benchmark(embed_mode='baseline', hf_model='BAAI/bge-small-en-v1.5',
                 result.f1 = f1_val
                 result.fpr = fpr
                 result.tpr = tpr_
-                P.logger.info(f"  {variant} s{seed}: P={p:.3f} R={r:.3f} F1={f1_val:.3f}")
+                parts = [f"  {variant} s{seed}: P={p:.3f} R={r:.3f} F1={f1_val:.3f}"]
+                if result.extra.get("llm_filter_stats"):
+                    ls = result.extra["llm_filter_stats"]
+                    parts.append(
+                        f"[LLM: rev={ls.get('n_reviewed',0)} kept={ls.get('n_kept',0)} "
+                        f"sup={ls.get('n_suppressed',0)} final={ls.get('n_final',0)}]"
+                    )
+                P.logger.info(" ".join(parts))
             else:
                 P.logger.info(f"  {variant} s{seed}: detected={len(detected_ids)} (no GT)")
 
@@ -488,6 +508,18 @@ if __name__ == "__main__":
                         help="Minimum validation GT overlap required before supervised threshold tuning")
     parser.add_argument("--sampled-dir", default=None,
                         help="Directory containing fair train/val/test JSONL for --mode tabular")
+    parser.add_argument("--llm-filter", action="store_true",
+                        help="Enable LLM post-filter for false positive reduction")
+    parser.add_argument("--llm-model", default="mistral-small-latest",
+                        help="Mistral model ID (default: mistral-small-latest)")
+    parser.add_argument("--llm-api-key", default=None,
+                        help="Mistral API key (falls back to MISTRAL_API_KEY env var)")
+    parser.add_argument("--llm-review-margin", type=float, default=0.15,
+                        help="Score range above threshold to send for LLM review (default: 0.15)")
+    parser.add_argument("--llm-max-candidates", type=int, default=500,
+                        help="Maximum borderline candidates to review via LLM (default: 500)")
+    parser.add_argument("--llm-cache-path", default="results/llm_filter_cache.jsonl",
+                        help="Cache file for LLM responses (default: results/llm_filter_cache.jsonl)")
     args = parser.parse_args()
 
     if args.embed_mode in ("hf", "both") and not os.environ.get("HF_TOKEN"):
@@ -497,6 +529,24 @@ if __name__ == "__main__":
         sys.exit(1)
 
     os.makedirs("results", exist_ok=True)
+
+    # ── LLM filter setup ──
+    llm_filter = None
+    if args.llm_filter:
+        from flash_llm_filter import MistralClient, LLMFilter
+
+        try:
+            _client = MistralClient(model=args.llm_model, api_key=args.llm_api_key)
+            llm_filter = LLMFilter(
+                client=_client,
+                review_margin=args.llm_review_margin,
+                max_candidates=args.llm_max_candidates,
+                cache_path=args.llm_cache_path,
+            )
+            logger.info("LLM filter enabled: model=%s margin=%.2f max=%d",
+                        args.llm_model, args.llm_review_margin, args.llm_max_candidates)
+        except ValueError as e:
+            logger.warning("LLM filter disabled: %s", e)
 
     if args.mode in ("all", "embed_parity"):
         run_embedding_parity()
@@ -515,7 +565,8 @@ if __name__ == "__main__":
                            hf_max_length=args.hf_max_length,
                            validation_ratio=args.validation_ratio,
                            fallback_quantile=args.fallback_quantile,
-                           min_validation_gt=args.min_validation_gt)
+                           min_validation_gt=args.min_validation_gt,
+                           llm_filter=llm_filter)
             logger.info("\n" + "=" * 60)
             logger.info("RUN 2/2: HF Transformer benchmark")
             logger.info("=" * 60)
@@ -525,7 +576,8 @@ if __name__ == "__main__":
                            hf_max_length=args.hf_max_length,
                            validation_ratio=args.validation_ratio,
                            fallback_quantile=args.fallback_quantile,
-                           min_validation_gt=args.min_validation_gt)
+                           min_validation_gt=args.min_validation_gt,
+                           llm_filter=llm_filter)
         else:
             run_benchmark(embed_mode=args.embed_mode,
                            hf_model=args.hf_model,
@@ -533,7 +585,8 @@ if __name__ == "__main__":
                            hf_max_length=args.hf_max_length,
                            validation_ratio=args.validation_ratio,
                            fallback_quantile=args.fallback_quantile,
-                           min_validation_gt=args.min_validation_gt)
+                           min_validation_gt=args.min_validation_gt,
+                           llm_filter=llm_filter)
 
     if args.mode in ("all", "tabular"):
         from flash_tabular import run_tabular_benchmark
@@ -544,6 +597,7 @@ if __name__ == "__main__":
             sampled_dir=sampled_dir,
             gt_path="data_files/cadets.json",
             out_path="results/benchmark_tabular.json",
+            llm_filter=llm_filter,
         )
         best = max(payload["results"], key=lambda row: row["test"]["f1"])
         logger.info(
@@ -551,6 +605,15 @@ if __name__ == "__main__":
             best["alpha"], best["test"]["precision"], best["test"]["recall"],
             best["test"]["f1"], best["test"]["pr_auc"], best["test"]["roc_auc"],
         )
+        if "llm_filtered" in best:
+            lf = best["llm_filtered"]
+            ls = best["llm_filter_stats"]
+            logger.info(
+                "  LLM-filtered: P=%.3f R=%.3f F1=%.3f | reviewed=%d kept=%d suppressed=%d final=%d",
+                lf["precision"], lf["recall"], lf["f1"],
+                ls.get("n_reviewed", 0), ls.get("n_kept", 0),
+                ls.get("n_suppressed", 0), ls.get("n_final", 0),
+            )
 
     if args.mode in ("all", "explain"):
         from flash_explain import generate_explanations

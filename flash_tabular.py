@@ -122,7 +122,7 @@ def _metrics(scores, labels, threshold):
     }
 
 
-def run_tabular_benchmark(sampled_dir: str, gt_path: str, out_path: str, alpha_values=None):
+def run_tabular_benchmark(sampled_dir: str, gt_path: str, out_path: str, alpha_values=None, llm_filter=None):
     alpha_values = alpha_values or [1e-6, 3e-6, 1e-5, 3e-5, 1e-4]
     with open(gt_path) as handle:
         gt = set(json.load(handle))
@@ -135,6 +135,10 @@ def run_tabular_benchmark(sampled_dir: str, gt_path: str, out_path: str, alpha_v
     train_x = vectorizer.transform(train_dicts)
     val_x = vectorizer.transform(val_dicts)
     test_x = vectorizer.transform(test_dicts)
+
+    train_feat_keys = set()
+    for d in train_dicts:
+        train_feat_keys.update(d.keys())
 
     results = []
     for alpha in alpha_values:
@@ -165,6 +169,45 @@ def run_tabular_benchmark(sampled_dir: str, gt_path: str, out_path: str, alpha_v
             "n_test_positive": int(test_y.sum()),
             "n_features": int(train_x.shape[1]),
         })
+
+    # ── LLM post-filter on best alpha ──
+    if llm_filter is not None:
+        from flash_llm_filter import extract_tabular_context
+
+        best_idx = max(range(len(results)), key=lambda i: results[i]["validation"]["f1"])
+        best_alpha = alpha_values[best_idx]
+        best_threshold = results[best_idx]["validation"]["threshold"]
+
+        model = SGDClassifier(
+            loss="log_loss",
+            penalty="l2",
+            alpha=float(best_alpha),
+            class_weight="balanced",
+            max_iter=200,
+            tol=1e-4,
+            random_state=42,
+        )
+        model.fit(train_x, train_y)
+        test_scores = model.decision_function(test_x)
+
+        node_contexts = {}
+        for nid, feat in zip(test_ids, test_dicts):
+            node_contexts[nid] = extract_tabular_context(feat, train_feat_keys)
+
+        filtered_ids, filter_stats = llm_filter.filter(
+            test_ids, test_scores.tolist(), node_contexts, best_threshold
+        )
+
+        y_pred = np.array([1 if nid in filtered_ids else 0 for nid in test_ids])
+        p, r, f1, _ = precision_recall_fscore_support(test_y, y_pred, average="binary", zero_division=0)
+
+        results[best_idx]["llm_filtered"] = {
+            "precision": float(p),
+            "recall": float(r),
+            "f1": float(f1),
+            "n_detected": int(y_pred.sum()),
+        }
+        results[best_idx]["llm_filter_stats"] = filter_stats
 
     payload = {"name": "FLASH Raw Tabular Benchmark", "sampled_dir": sampled_dir, "results": results}
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
