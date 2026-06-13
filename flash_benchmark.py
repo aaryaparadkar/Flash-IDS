@@ -7,15 +7,16 @@ Provides a uniform interface to:
   - Produce a comparison leaderboard with confidence intervals
 """
 
-import os
 import json
+import logging
+import os
 import time
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Callable, Sequence, Tuple
-from collections import defaultdict
-import logging
 
 logger = logging.getLogger("flash-benchmark")
 
@@ -44,6 +45,7 @@ class BenchResult:
 @dataclass
 class BenchRunConfig:
     """Describes one run in the evaluation matrix."""
+
     variant: str
     data_split: str
     seed: int
@@ -71,14 +73,20 @@ def score_auc(ids: Sequence[str], scores: Sequence[float], ground_truth_set):
     except Exception:
         return 0.0, 0.0
 
-    y_true = np.array([1 if node_id in ground_truth_set else 0 for node_id in ids], dtype=np.int32)
+    y_true = np.array(
+        [1 if node_id in ground_truth_set else 0 for node_id in ids], dtype=np.int32
+    )
     y_score = np.array(scores, dtype=np.float32)
     if len(np.unique(y_true)) < 2:
         return 0.0, 0.0
-    return float(average_precision_score(y_true, y_score)), float(roc_auc_score(y_true, y_score))
+    return float(average_precision_score(y_true, y_score)), float(
+        roc_auc_score(y_true, y_score)
+    )
 
 
-def detections_at_threshold(ids: Sequence[str], scores: Sequence[float], threshold: float):
+def detections_at_threshold(
+    ids: Sequence[str], scores: Sequence[float], threshold: float
+):
     """Return node IDs with anomaly score at or above a fixed threshold."""
     return {node_id for node_id, score in zip(ids, scores) if score >= threshold}
 
@@ -121,19 +129,23 @@ def optimize_threshold(
             detected, ground_truth_set, all_ids_set, eval_edges, eval_mapp
         )
         if f1_val > best["f1"]:
-            best.update({
-                "threshold": float(threshold),
-                "precision": p,
-                "recall": r,
-                "f1": f1_val,
-                "fpr": fpr,
-                "tpr": tpr,
-            })
+            best.update(
+                {
+                    "threshold": float(threshold),
+                    "precision": p,
+                    "recall": r,
+                    "f1": f1_val,
+                    "fpr": fpr,
+                    "tpr": tpr,
+                }
+            )
 
     return best["threshold"], best
 
 
-def two_hop_propagation(detected_set, ground_truth_set, all_ids_set, eval_edges, eval_mapp):
+def two_hop_propagation(
+    detected_set, ground_truth_set, all_ids_set, eval_edges, eval_mapp
+):
     """Replicate the FLASH helper/two-hop logic from the notebook."""
     ground_truth_set = ground_truth_set.intersection(all_ids_set)
     tp = detected_set.intersection(ground_truth_set)
@@ -173,15 +185,21 @@ class BenchmarkSuite:
     def add_configs(self, cfgs: List[BenchRunConfig]):
         self.configs.extend(cfgs)
 
-    def run(self, train_fn: Callable, infer_fn: Callable,
-            train_kwargs: Optional[Dict] = None,
-            infer_kwargs: Optional[Dict] = None):
+    def run(
+        self,
+        train_fn: Callable,
+        infer_fn: Callable,
+        train_kwargs: Optional[Dict] = None,
+        infer_kwargs: Optional[Dict] = None,
+    ):
         """Run all configs through train_fn / infer_fn."""
         train_kwargs = train_kwargs or {}
         infer_kwargs = infer_kwargs or {}
 
         for cfg in self.configs:
-            logger.info(f"Running: {cfg.variant} | split={cfg.data_split} | seed={cfg.seed}")
+            logger.info(
+                f"Running: {cfg.variant} | split={cfg.data_split} | seed={cfg.seed}"
+            )
             np.random.seed(cfg.seed)
 
             result = BenchResult(
@@ -239,7 +257,9 @@ class BenchmarkSuite:
                     result.extra["gt_overlap_test_ids"] = gt_overlap
                     result.extra["recall_ceiling"] = recall_ceiling
                     p, r, f1_val, fpr, tpr = two_hop_propagation(
-                        detected, gt, all_ids,
+                        detected,
+                        gt,
+                        all_ids,
                         infer_out.get("edges", [[], []]),
                         infer_out.get("mapp", []),
                     )
@@ -298,6 +318,7 @@ class BenchmarkSuite:
 
 # ── Helper: build time-split configs from a single JSONL ─────────────────
 
+
 def build_time_split_configs(
     jsonl_path: str,
     variant: str,
@@ -322,19 +343,21 @@ def build_time_split_configs(
         test_start = train_end
         test_end = min(test_start + window_size, total_lines)
 
-        split_name = f"T{i}_trainT0-T{i}_testT{i+1}"
+        split_name = f"T{i}_trainT0-T{i}_testT{i + 1}"
         for seed in seeds:
-            configs.append(BenchRunConfig(
-                variant=f"{variant}_{split_name}",
-                data_split=split_name,
-                seed=seed,
-                train_path=jsonl_path,
-                test_path=jsonl_path,
-                gt_path=gt_path,
-                num_snapshots=num_snapshots,
-                extra_cfg={
-                    "train_lines": (train_start, train_end),
-                    "test_lines": (test_start, test_end),
-                },
-            ))
+            configs.append(
+                BenchRunConfig(
+                    variant=f"{variant}_{split_name}",
+                    data_split=split_name,
+                    seed=seed,
+                    train_path=jsonl_path,
+                    test_path=jsonl_path,
+                    gt_path=gt_path,
+                    num_snapshots=num_snapshots,
+                    extra_cfg={
+                        "train_lines": (train_start, train_end),
+                        "test_lines": (test_start, test_end),
+                    },
+                )
+            )
     return configs

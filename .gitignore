@@ -1,2 +1,36 @@
+# Environment / secrets
 .env
+.env.local
+.env.*.local
 
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# HuggingFace model cache
+.hf_cache/
+
+# macOS artifacts
+.DS_Store
+
+# Large raw dataset (not version-controlled)
+cadets_full.jsonl
+
+# Derived edge files (regenerated from JSONL)
+cadets_train.txt
+cadets_test.txt
+cadets_val.txt
+
+# Experiment outputs (regenerated on run)
+benchmark_results_*.json
+results/
+trained_weights/
