@@ -1,0 +1,26 @@
+{
+  "window_mode": "time",
+  "windows": [
+    {
+      "window": "early",
+      "timeline": "Early sample",
+      "rows": 9381,
+      "start_timestamp_ns": 1522708380213318825,
+      "end_timestamp_ns": 1522748392852422372
+    },
+    {
+      "window": "middle",
+      "timeline": "Middle sample",
+      "rows": 70690,
+      "start_timestamp_ns": 1522748452862422042,
+      "end_timestamp_ns": 1522788423781531589
+    },
+    {
+      "window": "late",
+      "timeline": "Late sample",
+      "rows": 35674,
+      "start_timestamp_ns": 1522788483801526144,
+      "end_timestamp_ns": 1522828456910635425
+    }
+  ]
+}

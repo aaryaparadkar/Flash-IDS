@@ -1,7 +1,10 @@
 timeline,window,strategy,f1,psi_action,retrain_triggered,retrain_reason
-Early sample,early,Drift policy,0.020689655172413796,0.03960191570316407,False,ok
-Early sample,early,Static baseline,0.020689655172413796,0.03960191570316407,False,n/a
-Middle sample,middle,Drift policy,0.025723472668810286,0.03302165926863366,True,action_novelty=0.174>0.15
-Middle sample,middle,Static baseline,0.025723472668810286,0.03302165926863366,False,n/a
-Late sample,late,Drift policy,0.021978021978021973,0.06977120712432734,False,ok
-Late sample,late,Static baseline,0.0221606648199446,0.08766165101052778,False,n/a
+Early sample,early,Drift policy,0.022099447513812154,0.5028127407219506,False,kept current model: no candidate improved validation F1 without increasing FPR
+Early sample,early,Static baseline,0.022099447513812154,0.5028127407219506,False,n/a
+Early sample,early,Naive drift policy,0.022099447513812154,0.5028127407219506,True,PSI(action)=0.503>0.2
+Middle sample,middle,Drift policy,0.020512820512820513,0.6809577475119102,False,kept current model: no candidate improved validation F1 without increasing FPR
+Middle sample,middle,Static baseline,0.020512820512820513,0.6809577475119102,False,n/a
+Middle sample,middle,Naive drift policy,0.015384615384615384,0.31648921198219426,True,PSI(action)=0.316>0.2
+Late sample,late,Drift policy,0.01937046004842615,0.04148502040854543,False,kept current model: no candidate improved validation F1 without increasing FPR
+Late sample,late,Static baseline,0.01937046004842615,0.04148502040854543,False,n/a
+Late sample,late,Naive drift policy,0.012012012012012012,0.14999668765313634,False,ok

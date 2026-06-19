@@ -713,6 +713,38 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None, sou
     if adaptive_rows:
         summary_df = pd.concat([summary_df, pd.DataFrame(adaptive_rows)], ignore_index=True)
 
+    gated_rows = []
+    validation_candidates = ["triggered", "expanding", "sliding_k2", "recent_only", "anchor_recent"]
+    for (seed_value, test_window), group in summary_df.groupby(["seed", "test_window"]):
+        current_rows = group[group["strategy"] == "static_w0"]
+        candidates = group[group["strategy"].isin(validation_candidates)].copy()
+        if current_rows.empty or candidates.empty:
+            continue
+
+        current = current_rows.iloc[0].copy()
+        improving = candidates[
+            (candidates["f1"] > current["f1"]) &
+            (candidates["fpr"] <= current["fpr"])
+        ].copy()
+        if improving.empty:
+            chosen = current
+            chosen["retrain_reason"] = "kept current model: no candidate improved validation F1 without increasing FPR"
+        else:
+            chosen = (
+                improving
+                .sort_values(["f1", "fpr"], ascending=[False, True])
+                .iloc[0]
+                .copy()
+            )
+            chosen["retrain_reason"] = "accepted candidate: validation F1 improved without increasing FPR"
+
+        chosen["strategy"] = "gated_validation"
+        chosen["retrain_triggered"] = chosen["train_windows"] != current["train_windows"]
+        gated_rows.append(chosen.to_dict())
+
+    if gated_rows:
+        summary_df = pd.concat([summary_df, pd.DataFrame(gated_rows)], ignore_index=True)
+
     aggregate_df = (
         summary_df
         .groupby("strategy", as_index=False)
@@ -791,6 +823,7 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None, sou
         "- Static W0 is the no-adaptation baseline.",
         "- Compare mean F1 and mean FPR together; the best drift strategy should improve detection without inflating false positives.",
         "- Adaptive-online selects among candidate retraining windows using anomaly rate, so it does not need ground-truth labels at selection time.",
+        "- Gated-validation is an offline safety policy: it accepts retraining only when candidate validation F1 improves and FPR does not increase.",
         "- Expanding and triggered retraining show whether adaptive retraining improves over the static baseline.",
         "- Recent-only retraining tests fast adaptation, but can forget older normal behavior.",
         "- Anchor-recent retraining tests a compromise: keep W0 as the stable baseline and add the latest behavior window.",
@@ -813,6 +846,11 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None, sou
                 "selection_signal": "minimum anomaly_rate, tie-break by maximum mean_confidence",
                 "note": "This is a label-free model-selection policy evaluated from already trained candidate windows.",
             },
+            "gated_validation_policy": {
+                "candidate_strategies": validation_candidates,
+                "selection_signal": "accept candidate only if validation F1 improves and FPR does not increase",
+                "note": "This uses labels, so it is an offline validation gate or delayed-label deployment gate.",
+            },
             "trigger_policy": {
                 "action_psi_threshold": 0.2,
                 "object_type_psi_threshold": 0.2,
@@ -833,6 +871,41 @@ def run_rolling_drift_experiment(num_windows=4, num_snapshots=6, seeds=None, sou
     summary_df.to_csv("results/rolling_drift_summary.csv", index=False)
     aggregate_df.to_csv("results/rolling_drift_strategy_averages.csv", index=False)
     best_by_window_df.to_csv("results/rolling_drift_best_by_window.csv", index=False)
+    timeline_map = {
+        "W1": ("Early sample", "early"),
+        "W2": ("Middle sample", "middle"),
+        "W3": ("Late sample", "late"),
+    }
+    graph_rows = []
+    graph_strategy_map = {
+        "static_w0": "Static baseline",
+        "triggered": "Naive drift policy",
+        "gated_validation": "Drift policy",
+    }
+    graph_df = (
+        summary_df[summary_df["strategy"].isin(graph_strategy_map)]
+        .groupby(["test_window", "strategy"], as_index=False)
+        .agg(
+            f1=("f1", "mean"),
+            psi_action=("psi_action", "mean"),
+            retrain_triggered=("retrain_triggered", "max"),
+            retrain_reason=("retrain_reason", "first"),
+        )
+    )
+    for _, row in graph_df.iterrows():
+        if row["test_window"] not in timeline_map:
+            continue
+        timeline, window = timeline_map[row["test_window"]]
+        graph_rows.append({
+            "timeline": timeline,
+            "window": window,
+            "strategy": graph_strategy_map[row["strategy"]],
+            "f1": row["f1"],
+            "psi_action": row["psi_action"],
+            "retrain_triggered": bool(row["retrain_triggered"]),
+            "retrain_reason": row["retrain_reason"],
+        })
+    pd.DataFrame(graph_rows).to_csv("results/cadets_full_f1_timeline_with_drift_policy.csv", index=False)
     with open("results/rolling_drift_report.md", "w") as f:
         f.write("\n".join(report_lines))
     logger.info(f"\nRolling drift benchmark saved to {out_path}")

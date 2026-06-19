@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif}.axis{stroke:#4b5965;stroke-width:1.4}.grid{stroke:#d9e1e8;stroke-width:1}.line{fill:none;stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round}.threshold{stroke:#8b1e3f;stroke-width:2;stroke-dasharray:7 6}</style>
+<text x="450.0" y="36.0" text-anchor="middle" font-size="24" font-weight="700" fill="#1f2933">Graph 4: Ground-Truth Coverage</text>
+<text x="450.0" y="64.0" text-anchor="middle" font-size="14" font-weight="400" fill="#1f2933">Explains how reliable each F1 point is.</text>
+<line class="grid" x1="92" y1="448.0" x2="846" y2="448.0"/>
+<text x="78.0" y="453.0" text-anchor="end" font-size="12" font-weight="400" fill="#1f2933">0.000</text>
+<line class="grid" x1="92" y1="376.4" x2="846" y2="376.4"/>
+<text x="78.0" y="381.4" text-anchor="end" font-size="12" font-weight="400" fill="#1f2933">47.400</text>
+<line class="grid" x1="92" y1="304.8" x2="846" y2="304.8"/>
+<text x="78.0" y="309.8" text-anchor="end" font-size="12" font-weight="400" fill="#1f2933">94.800</text>
+<line class="grid" x1="92" y1="233.2" x2="846" y2="233.2"/>
+<text x="78.0" y="238.2" text-anchor="end" font-size="12" font-weight="400" fill="#1f2933">142.200</text>
+<line class="grid" x1="92" y1="161.6" x2="846" y2="161.6"/>
+<text x="78.0" y="166.6" text-anchor="end" font-size="12" font-weight="400" fill="#1f2933">189.600</text>
+<line class="grid" x1="92" y1="90.0" x2="846" y2="90.0"/>
+<text x="78.0" y="95.0" text-anchor="end" font-size="12" font-weight="400" fill="#1f2933">237.000</text>
+<line class="axis" x1="92" y1="90" x2="92" y2="448"/>
+<line class="axis" x1="92" y1="448" x2="846" y2="448"/>
+<text transform="rotate(-90 28 269.0)" x="28.0" y="269.0" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2933">GT IDs in window</text>
+<text x="469.0" y="532.0" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2933">Timeline window</text>
+<line class="axis" x1="92.0" y1="448" x2="92.0" y2="455"/>
+<text x="92.0" y="478.0" text-anchor="middle" font-size="14" font-weight="700" fill="#1f2933">Early sample</text>
+<text x="92.0" y="498.0" text-anchor="middle" font-size="12" font-weight="400" fill="#1f2933">early</text>
+<line class="axis" x1="469.0" y1="448" x2="469.0" y2="455"/>
+<text x="469.0" y="478.0" text-anchor="middle" font-size="14" font-weight="700" fill="#1f2933">Middle sample</text>
+<text x="469.0" y="498.0" text-anchor="middle" font-size="12" font-weight="400" fill="#1f2933">middle</text>
+<line class="axis" x1="846.0" y1="448" x2="846.0" y2="455"/>
+<text x="846.0" y="478.0" text-anchor="middle" font-size="14" font-weight="700" fill="#1f2933">Late sample</text>
+<text x="846.0" y="498.0" text-anchor="middle" font-size="12" font-weight="400" fill="#1f2933">late</text>
+<text x="846.0" y="80.0" text-anchor="end" font-size="12" font-weight="700" fill="#1f2933">Global GT IDs = 237</text>
+<rect x="38.1" y="442.0" width="107.7" height="6.0" fill="#3B6EA8"/>
+<text x="92.0" y="432.0" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2933">4/237</text>
+<text x="92.0" y="520.0" text-anchor="middle" font-size="12" font-weight="400" fill="#1f2933">ceiling 0.017</text>
+<rect x="415.1" y="442.0" width="107.7" height="6.0" fill="#3B6EA8"/>
+<text x="469.0" y="432.0" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2933">4/237</text>
+<text x="469.0" y="520.0" text-anchor="middle" font-size="12" font-weight="400" fill="#1f2933">ceiling 0.017</text>
+<rect x="792.1" y="442.0" width="107.7" height="6.0" fill="#3B6EA8"/>
+<text x="846.0" y="432.0" text-anchor="middle" font-size="13" font-weight="700" fill="#1f2933">4/237</text>
+<text x="846.0" y="520.0" text-anchor="middle" font-size="12" font-weight="400" fill="#1f2933">ceiling 0.017</text>
+</svg>
